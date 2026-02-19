@@ -7,8 +7,8 @@ compatibility_date = "2025-03-01"
 # After running `wrangler kv:namespace create BOT_KV --preview`, paste the preview_id below.
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_PREVIEW_KV_NAMESPACE_ID"
+id = "d0f883ea599f480d8b4c90849378d43a"
+preview_id = "1c7c788345da4a19911f869d2211b58a"
 
 # ─── Environment Variables ────────────────────────────────────────────────────
 [vars]
