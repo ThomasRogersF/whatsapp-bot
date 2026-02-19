@@ -1,0 +1,52 @@
+name = "twilio-whatsapp-bot"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+
+# ─── KV Namespace ─────────────────────────────────────────────────────────────
+# After running `wrangler kv:namespace create BOT_KV`, paste the returned id below.
+# After running `wrangler kv:namespace create BOT_KV --preview`, paste the preview_id below.
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_PREVIEW_KV_NAMESPACE_ID"
+
+# ─── Environment Variables ────────────────────────────────────────────────────
+[vars]
+MIN_WEEKLY_HOURS = "15"
+# Secrets (do NOT put sensitive values here — use `wrangler secret put` instead):
+#
+#   wrangler secret put MAKE_WEBHOOK_URL
+#     -> The Make.com (or other) webhook URL to POST screening results to.
+#        Leave unset to skip the result webhook entirely.
+#
+#   wrangler secret put MARIA_WHATSAPP_HANDOFF_TEXT
+#     -> Text displayed to candidates who PASS screening.
+#        Example: "Please message Maria at +1 (555) 000-0000 or book at https://calendly.com/..."
+
+# ─── Deployment Commands ──────────────────────────────────────────────────────
+# 1. Authenticate:
+#      wrangler login
+#
+# 2. Create KV namespace (production):
+#      wrangler kv:namespace create BOT_KV
+#      -> Copy the printed id into [[kv_namespaces]] id above
+#
+# 3. Create KV namespace (local dev / preview):
+#      wrangler kv:namespace create BOT_KV --preview
+#      -> Copy the printed id into [[kv_namespaces]] preview_id above
+#
+# 4. Set secrets:
+#      wrangler secret put MAKE_WEBHOOK_URL
+#      wrangler secret put MARIA_WHATSAPP_HANDOFF_TEXT
+#
+# 5. Deploy:
+#      wrangler deploy
+#
+# 6. View live logs:
+#      wrangler tail
+#
+# 7. Local development server:
+#      wrangler dev
+#
+# After deploying, set your Twilio WhatsApp Sandbox webhook URL to:
+#   https://twilio-whatsapp-bot.<your-account>.workers.dev/whatsapp
