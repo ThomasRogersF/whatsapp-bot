@@ -249,16 +249,24 @@ async function createContentTemplate(
 }
 
 // Returns the ContentSid for a question step, creating and caching it lazily.
-async function getContentSid(step: ScreeningStep, env: Env): Promise<string> {
+// Always returns a valid SID — either from KV cache or freshly created via the
+// Twilio Content API. Callers must always proceed to send after this returns.
+async function getOrCreateContentSid(
+  step: ScreeningStep,
+  env: Env
+): Promise<string> {
   const kvKey = `content_sid:${step}`;
   const cached = await safeKvGet(env.BOT_KV, kvKey);
-  if (cached) return cached;
+  if (cached) {
+    console.log(`[getOrCreateContentSid] step=${step} cache_hit sid=${cached}`);
+    return cached;
+  }
 
   const sid = await createContentTemplate(step, env);
   await safeKvPut(env.BOT_KV, kvKey, sid, {
     expirationTtl: CONTENT_SID_KV_TTL,
   });
-  console.log(`Content template created for ${step}: ${sid}`);
+  console.log(`[getOrCreateContentSid] step=${step} created sid=${sid}`);
   return sid;
 }
 
@@ -290,13 +298,19 @@ async function sendTwilioText(
   }
 }
 
-// Sends a question with quick-reply buttons via the Twilio Messages REST API.
-async function sendQuestion(
+// Sends a WhatsApp message using a Twilio Content template (quick-reply buttons).
+// Separated from getOrCreateContentSid so that obtaining the SID and sending are
+// two distinct, always-executed steps with full observability on both.
+async function sendMessageWithContent(
   to: string,
   step: ScreeningStep,
+  contentSid: string,
   env: Env
 ): Promise<void> {
-  const contentSid = await getContentSid(step, env);
+  console.log(
+    `[sendMessageWithContent] step=${step} contentSid=${contentSid} to=${to} from=${env.TWILIO_WHATSAPP_FROM}`
+  );
+
   const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`;
   const params = new URLSearchParams({
     To: to,
@@ -313,12 +327,28 @@ async function sendQuestion(
     body: params.toString(),
   });
 
-  if (!res.ok) {
+  if (res.ok) {
+    const data = (await res.json()) as { sid: string };
+    console.log(
+      `[sendMessageWithContent] step=${step} success MessageSid=${data.sid}`
+    );
+  } else {
     const text = await res.text().catch(() => "");
     console.error(
-      `Messages API error ${res.status} sending ${step} buttons: ${text}`
+      `[sendMessageWithContent] step=${step} error status=${res.status} body=${text}`
     );
   }
+}
+
+// Sends a question with quick-reply buttons via the Twilio Messages REST API.
+// Always executes both steps: obtain ContentSid, then send — even on first creation.
+async function sendQuestion(
+  to: string,
+  step: ScreeningStep,
+  env: Env
+): Promise<void> {
+  const contentSid = await getOrCreateContentSid(step, env);
+  await sendMessageWithContent(to, step, contentSid, env);
 }
 
 // ─── Result Webhook ───────────────────────────────────────────────────────────
