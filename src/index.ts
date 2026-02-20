@@ -11,7 +11,6 @@ export interface Env {
   MAKE_WEBHOOK_URL?: string;
   MARIA_WA_ME_LINK?: string;
   MIN_WEEKLY_HOURS?: string;
-  CONTENT_LANGUAGE?: string;
 }
 
 type ScreeningStep = "Q1" | "Q2" | "Q3" | "Q4" | "Q5";
@@ -46,64 +45,18 @@ interface ResultPayload {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const SESSION_TTL_SECONDS = 604_800;   // 7 days
-const CONTENT_SID_KV_TTL = 31_536_000; // 1 year — Content templates don't expire
 const RATE_LIMIT_WINDOW_MS = 10_000;   // 10 seconds
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_KV_TTL = 60;          // 60 seconds (KV minimum)
 
-// Button definitions for each question.
-// WhatsApp via Twilio supports a maximum of 3 quick-reply buttons per message.
-const QUESTION_CONTENT: Record<
-  ScreeningStep,
-  { body: string; actions: { title: string; id: string }[] }
-> = {
-  Q1: {
-    body: "Q1/5 - Are you looking for a TEAM role (not marketplace/freelance like italki or Preply)?",
-    actions: [
-      { title: "Yes", id: "Q1_YES" },
-      { title: "No", id: "Q1_NO" },
-    ],
-  },
-  Q2: {
-    body: "Q2/5 - What is your weekly availability?",
-    actions: [
-      { title: "Full-time (30+ hrs/wk)", id: "Q2_FT" },
-      { title: "Part-time (15-29 hrs/wk)", id: "Q2_PT" },
-      { title: "Less than 15 hrs/wk", id: "Q2_LOW" },
-    ],
-  },
-  Q3: {
-    body: "Q3/5 - When can you start?",
-    actions: [
-      { title: "Immediately", id: "Q3_NOW" },
-      { title: "1-2 weeks", id: "Q3_2W" },
-      { title: "1 month+", id: "Q3_1M" },
-    ],
-  },
-  Q4: {
-    body: "Q4/5 - Do you have a stable internet connection and a quiet teaching setup?",
-    actions: [
-      { title: "Yes", id: "Q4_YES" },
-      { title: "No", id: "Q4_NO" },
-    ],
-  },
-  Q5: {
-    body: "Q5/5 - Are you willing to follow a set curriculum and SOPs?",
-    actions: [
-      { title: "Yes", id: "Q5_YES" },
-      { title: "No", id: "Q5_NO" },
-    ],
-  },
-};
-
-// Plain-text fallback messages sent when the ContentSid quick-reply fails.
-// Keywords listed here are also recognised as valid typed inputs in handleStep.
-const QUESTION_FALLBACK: Record<ScreeningStep, string> = {
-  Q1: "Q1/5: Looking for a TEAM role (not marketplace/freelance)? Reply YES or NO",
-  Q2: "Q2/5: Weekly availability? Reply FULLTIME, PARTTIME, or LOW",
-  Q3: "Q3/5: When can you start? Reply NOW, 2WEEKS, or 1MONTH",
-  Q4: "Q4/5: Stable internet and quiet teaching setup? Reply YES or NO",
-  Q5: "Q5/5: Willing to follow a set curriculum and SOPs? Reply YES or NO",
+// Plain-text question messages. Each message lists all accepted typed/numeric
+// replies so the flow works regardless of whether WhatsApp delivers buttons.
+const QUESTION_TEXT: Record<ScreeningStep, string> = {
+  Q1: "Q1/5: Are you looking for a TEAM role (not marketplace/freelance like italki or Preply)?\nReply YES or NO  (or 1 / 2)",
+  Q2: "Q2/5: What is your weekly availability?\n1 - FULLTIME (30+ hrs/wk)\n2 - PARTTIME (15-29 hrs/wk)\n3 - LOW (less than 15 hrs/wk)\nReply FULLTIME, PARTTIME, LOW, or 1 / 2 / 3",
+  Q3: "Q3/5: When can you start?\n1 - NOW (immediately)\n2 - 2WEEKS (1-2 weeks)\n3 - 1MONTH (1 month+)\nReply NOW, 2WEEKS, 1MONTH, or 1 / 2 / 3",
+  Q4: "Q4/5: Do you have a stable internet connection and a quiet teaching setup?\nReply YES or NO  (or 1 / 2)",
+  Q5: "Q5/5: Are you willing to follow a set curriculum and SOPs?\nReply YES or NO  (or 1 / 2)",
 };
 
 // ─── Text Sanitization ────────────────────────────────────────────────────────
@@ -216,8 +169,8 @@ async function checkRateLimit(from: string, env: Env): Promise<boolean> {
 // ─── TwiML Ack ────────────────────────────────────────────────────────────────
 
 // Returns an empty TwiML <Response/> to acknowledge the webhook immediately.
-// All outbound messages are sent via the Twilio REST API (see sendTwilioText /
-// sendQuestion below) so Twilio does not wait for us to compose a reply.
+// All outbound messages are sent via the Twilio REST API (see sendTwilioText
+// below) so Twilio does not wait for us to compose a reply.
 function twimlAck(): Response {
   return new Response('<?xml version="1.0" encoding="UTF-8"?>\n<Response/>', {
     status: 200,
@@ -229,68 +182,6 @@ function twimlAck(): Response {
 
 function twilioBasicAuth(env: Env): string {
   return "Basic " + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
-}
-
-// Creates a twilio/quick-reply Content template and returns its ContentSid.
-async function createContentTemplate(
-  step: ScreeningStep,
-  env: Env
-): Promise<string> {
-  const q = QUESTION_CONTENT[step];
-  const language = env.CONTENT_LANGUAGE ?? "en";
-  console.log(`[createContentTemplate] step=${step} language=${language}`);
-  const body = JSON.stringify({
-    friendly_name: `bot_${step.toLowerCase()}`,
-    language,
-    types: {
-      "twilio/quick-reply": {
-        body: sanitize(q.body),
-        actions: q.actions.map((a) => ({ ...a, title: sanitize(a.title) })),
-      },
-    },
-  });
-
-  const res = await fetch("https://content.twilio.com/v1/Content", {
-    method: "POST",
-    headers: {
-      Authorization: twilioBasicAuth(env),
-      "Content-Type": "application/json",
-    },
-    body,
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `Content API error ${res.status} for step ${step}: ${text}`
-    );
-  }
-
-  const data = (await res.json()) as { sid: string };
-  console.log(`[createContentTemplate] step=${step} ContentSid=${data.sid}`);
-  return data.sid;
-}
-
-// Returns the ContentSid for a question step, creating and caching it lazily.
-// Always returns a valid SID — either from KV cache or freshly created via the
-// Twilio Content API. Callers must always proceed to send after this returns.
-async function getOrCreateContentSid(
-  step: ScreeningStep,
-  env: Env
-): Promise<string> {
-  const kvKey = `content_sid:${step}`;
-  const cached = await safeKvGet(env.BOT_KV, kvKey);
-  if (cached) {
-    console.log(`[getOrCreateContentSid] step=${step} cache_hit sid=${cached}`);
-    return cached;
-  }
-
-  const sid = await createContentTemplate(step, env);
-  await safeKvPut(env.BOT_KV, kvKey, sid, {
-    expirationTtl: CONTENT_SID_KV_TTL,
-  });
-  console.log(`[getOrCreateContentSid] step=${step} created sid=${sid}`);
-  return sid;
 }
 
 // Sends a plain text WhatsApp message via the Twilio Messages REST API.
@@ -330,67 +221,6 @@ async function sendTwilioText(
     const text = await res.text().catch(() => "");
     console.error(`[sendTwilioText] error status=${res.status} body=${text}`);
     return false;
-  }
-}
-
-// Sends a WhatsApp message using a Twilio Content template (quick-reply buttons).
-// Returns true on success, false on failure (caller may then send a plain fallback).
-async function sendMessageWithContent(
-  to: string,
-  step: ScreeningStep,
-  contentSid: string,
-  env: Env
-): Promise<boolean> {
-  console.log(
-    `[sendMessageWithContent] step=${step} type=content contentSid=${contentSid} to=${to} from=${env.TWILIO_WHATSAPP_FROM}`
-  );
-
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`;
-  const params = new URLSearchParams({
-    To: to,
-    From: env.TWILIO_WHATSAPP_FROM,
-    ContentSid: contentSid,
-  });
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: twilioBasicAuth(env),
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: params.toString(),
-  });
-
-  if (res.ok) {
-    const data = (await res.json()) as { sid: string };
-    console.log(
-      `[sendMessageWithContent] step=${step} success MessageSid=${data.sid}`
-    );
-    return true;
-  } else {
-    const text = await res.text().catch(() => "");
-    console.error(
-      `[sendMessageWithContent] step=${step} error status=${res.status} body=${text}`
-    );
-    return false;
-  }
-}
-
-// Sends a question with quick-reply buttons.
-// On non-2xx from the Messages API, immediately falls back to a plain-text
-// message with typed-option instructions so the flow is never silently broken.
-async function sendQuestion(
-  to: string,
-  step: ScreeningStep,
-  env: Env
-): Promise<void> {
-  const contentSid = await getOrCreateContentSid(step, env);
-  const ok = await sendMessageWithContent(to, step, contentSid, env);
-  if (!ok) {
-    console.warn(
-      `[sendQuestion] step=${step} content send failed — sending plain-text fallback to=${to}`
-    );
-    await sendTwilioText(to, QUESTION_FALLBACK[step], env);
   }
 }
 
@@ -497,13 +327,13 @@ async function handleStep(
         session.step = "Q2";
         console.log(`[handleStep] from=${from} step.after=${session.step}`);
         await saveSession(from, session, env);
-        await sendQuestion(from, "Q2", env);
+        await sendTwilioText(from, QUESTION_TEXT["Q2"], env);
       } else if (input === "Q1_NO" || input === "no" || input === "n" || input === "2") {
         session.answers.q1_team_role = "no";
         await failSession(from, session, "Looking for marketplace/freelance work", env);
       } else {
         console.log(`[handleStep] from=${from} step=${stepBefore} unrecognised input — re-prompting`);
-        await sendTwilioText(from, QUESTION_FALLBACK["Q1"], env);
+        await sendTwilioText(from, QUESTION_TEXT["Q1"], env);
       }
       return;
     }
@@ -523,7 +353,7 @@ async function handleStep(
         session.step = "Q3";
         console.log(`[handleStep] from=${from} step.after=${session.step}`);
         await saveSession(from, session, env);
-        await sendQuestion(from, "Q3", env);
+        await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
       } else if (
         input === "Q2_PT" ||
         input === "parttime" ||
@@ -538,7 +368,7 @@ async function handleStep(
           session.step = "Q3";
           console.log(`[handleStep] from=${from} step.after=${session.step}`);
           await saveSession(from, session, env);
-          await sendQuestion(from, "Q3", env);
+          await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
         }
       } else if (
         input === "Q2_LOW" ||
@@ -551,7 +381,7 @@ async function handleStep(
         await failSession(from, session, "Insufficient weekly hours", env);
       } else {
         console.log(`[handleStep] from=${from} step=${stepBefore} unrecognised input — re-prompting`);
-        await sendTwilioText(from, QUESTION_FALLBACK["Q2"], env);
+        await sendTwilioText(from, QUESTION_TEXT["Q2"], env);
       }
       return;
     }
@@ -571,7 +401,7 @@ async function handleStep(
         session.step = "Q4";
         console.log(`[handleStep] from=${from} step.after=${session.step}`);
         await saveSession(from, session, env);
-        await sendQuestion(from, "Q4", env);
+        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
       } else if (
         input === "Q3_2W" ||
         input === "2weeks" ||
@@ -584,7 +414,7 @@ async function handleStep(
         session.step = "Q4";
         console.log(`[handleStep] from=${from} step.after=${session.step}`);
         await saveSession(from, session, env);
-        await sendQuestion(from, "Q4", env);
+        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
       } else if (
         input === "Q3_1M" ||
         input === "1month" ||
@@ -596,10 +426,10 @@ async function handleStep(
         session.step = "Q4";
         console.log(`[handleStep] from=${from} step.after=${session.step}`);
         await saveSession(from, session, env);
-        await sendQuestion(from, "Q4", env);
+        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
       } else {
         console.log(`[handleStep] from=${from} step=${stepBefore} unrecognised input — re-prompting`);
-        await sendTwilioText(from, QUESTION_FALLBACK["Q3"], env);
+        await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
       }
       return;
     }
@@ -611,13 +441,13 @@ async function handleStep(
         session.step = "Q5";
         console.log(`[handleStep] from=${from} step.after=${session.step}`);
         await saveSession(from, session, env);
-        await sendQuestion(from, "Q5", env);
+        await sendTwilioText(from, QUESTION_TEXT["Q5"], env);
       } else if (input === "Q4_NO" || input === "no" || input === "n" || input === "2") {
         session.answers.q4_setup = "no";
         await failSession(from, session, "No suitable teaching setup", env);
       } else {
         console.log(`[handleStep] from=${from} step=${stepBefore} unrecognised input — re-prompting`);
-        await sendTwilioText(from, QUESTION_FALLBACK["Q4"], env);
+        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
       }
       return;
     }
@@ -632,7 +462,7 @@ async function handleStep(
         await failSession(from, session, "Unwilling to follow curriculum", env);
       } else {
         console.log(`[handleStep] from=${from} step=${stepBefore} unrecognised input — re-prompting`);
-        await sendTwilioText(from, QUESTION_FALLBACK["Q5"], env);
+        await sendTwilioText(from, QUESTION_TEXT["Q5"], env);
       }
       return;
     }
@@ -641,7 +471,7 @@ async function handleStep(
 
 // processAndSend runs entirely inside ctx.waitUntil() — the webhook has already
 // returned <Response/> before this executes. All user-facing output goes via
-// sendTwilioText() or sendQuestion().
+// sendTwilioText().
 async function processAndSend(
   from: string,
   buttonPayload: string | null,
@@ -691,9 +521,9 @@ async function processAndSend(
       const newSession = createSession();
       await saveSession(from, newSession, env);
       if (upper === "RESTART") {
-        await sendTwilioText(from, "Session restarted. Here's Q1:", env);
+        await sendTwilioText(from, "Session restarted.", env);
       }
-      await sendQuestion(from, "Q1", env);
+      await sendTwilioText(from, QUESTION_TEXT["Q1"], env);
       return;
     }
 
