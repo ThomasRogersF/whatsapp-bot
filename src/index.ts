@@ -223,7 +223,7 @@ async function createContentTemplate(
     },
   });
 
-  const res = await fetch("https://content.twilio.com/v1/Contents", {
+  const res = await fetch("https://content.twilio.com/v1/Content", {
     method: "POST",
     headers: {
       Authorization: twilioBasicAuth(env),
@@ -240,6 +240,7 @@ async function createContentTemplate(
   }
 
   const data = (await res.json()) as { sid: string };
+  console.log(`[createContentTemplate] step=${step} ContentSid=${data.sid}`);
   return data.sid;
 }
 
