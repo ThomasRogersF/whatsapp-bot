@@ -11,6 +11,7 @@ export interface Env {
   MAKE_WEBHOOK_URL?: string;
   MARIA_WA_ME_LINK?: string;
   MIN_WEEKLY_HOURS?: string;
+  CONTENT_LANGUAGE?: string;
 }
 
 type ScreeningStep = "Q1" | "Q2" | "Q3" | "Q4" | "Q5";
@@ -213,8 +214,11 @@ async function createContentTemplate(
   env: Env
 ): Promise<string> {
   const q = QUESTION_CONTENT[step];
+  const language = env.CONTENT_LANGUAGE ?? "en";
+  console.log(`[createContentTemplate] step=${step} language=${language}`);
   const body = JSON.stringify({
     friendly_name: `bot_${step.toLowerCase()}`,
+    language,
     types: {
       "twilio/quick-reply": {
         body: q.body,
