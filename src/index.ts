@@ -2,8 +2,14 @@
 
 export interface Env {
   BOT_KV: KVNamespace;
+  // Twilio credentials (secrets)
+  TWILIO_ACCOUNT_SID: string;
+  TWILIO_AUTH_TOKEN: string;
+  // Twilio sender number, e.g. "whatsapp:+57xxxxxxxxxx"
+  TWILIO_WHATSAPP_FROM: string;
+  // Optional
   MAKE_WEBHOOK_URL?: string;
-  MARIA_WHATSAPP_HANDOFF_TEXT?: string;
+  MARIA_WA_ME_LINK?: string;
   MIN_WEEKLY_HOURS?: string;
 }
 
@@ -29,7 +35,6 @@ interface RateLimitRecord {
 }
 
 interface ResultPayload {
-  applicant_token: "";
   whatsapp_from: string;
   result: "pass" | "fail";
   reason: string;
@@ -39,17 +44,55 @@ interface ResultPayload {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION_TTL_SECONDS = 604800; // 7 days
-const RATE_LIMIT_WINDOW_MS = 10_000; // 10 seconds
+const SESSION_TTL_SECONDS = 604_800;   // 7 days
+const CONTENT_SID_KV_TTL = 31_536_000; // 1 year — Content templates don't expire
+const RATE_LIMIT_WINDOW_MS = 10_000;   // 10 seconds
 const RATE_LIMIT_MAX = 5;
-const RATE_LIMIT_KV_TTL = 60; // 60 seconds (KV minimum)
+const RATE_LIMIT_KV_TTL = 60;          // 60 seconds (KV minimum)
 
-const QUESTION_PROMPTS: Record<ScreeningStep, string> = {
-  Q1: "Q1/5 — Are you looking for a TEAM role (not marketplace/freelance like italki or Preply)?\n1) Yes\n2) No",
-  Q2: "Q2/5 — What is your weekly availability?\n1) Full-time (30+ hrs/wk)\n2) Part-time (15–29 hrs/wk)\n3) Less than 15 hrs/wk",
-  Q3: "Q3/5 — When can you start?\n1) Immediately\n2) 1–2 weeks\n3) 1 month+",
-  Q4: "Q4/5 — Do you have a stable internet connection and a quiet teaching setup?\n1) Yes\n2) No",
-  Q5: "Q5/5 — Are you willing to follow a set curriculum and SOPs?\n1) Yes\n2) No",
+// Button definitions for each question.
+// WhatsApp via Twilio supports a maximum of 3 quick-reply buttons per message.
+const QUESTION_CONTENT: Record<
+  ScreeningStep,
+  { body: string; actions: { title: string; id: string }[] }
+> = {
+  Q1: {
+    body: "Q1/5 \u2014 Are you looking for a TEAM role (not marketplace/freelance like italki or Preply)?",
+    actions: [
+      { title: "Yes", id: "Q1_YES" },
+      { title: "No", id: "Q1_NO" },
+    ],
+  },
+  Q2: {
+    body: "Q2/5 \u2014 What is your weekly availability?",
+    actions: [
+      { title: "Full-time (30+ hrs/wk)", id: "Q2_FT" },
+      { title: "Part-time (15\u201329 hrs/wk)", id: "Q2_PT" },
+      { title: "Less than 15 hrs/wk", id: "Q2_LOW" },
+    ],
+  },
+  Q3: {
+    body: "Q3/5 \u2014 When can you start?",
+    actions: [
+      { title: "Immediately", id: "Q3_NOW" },
+      { title: "1\u20132 weeks", id: "Q3_2W" },
+      { title: "1 month+", id: "Q3_1M" },
+    ],
+  },
+  Q4: {
+    body: "Q4/5 \u2014 Do you have a stable internet connection and a quiet teaching setup?",
+    actions: [
+      { title: "Yes", id: "Q4_YES" },
+      { title: "No", id: "Q4_NO" },
+    ],
+  },
+  Q5: {
+    body: "Q5/5 \u2014 Are you willing to follow a set curriculum and SOPs?",
+    actions: [
+      { title: "Yes", id: "Q5_YES" },
+      { title: "No", id: "Q5_NO" },
+    ],
+  },
 };
 
 // ─── KV Helpers ───────────────────────────────────────────────────────────────
@@ -88,12 +131,7 @@ async function safeKvDelete(kv: KVNamespace, key: string): Promise<void> {
 
 function createSession(): SessionState {
   const now = new Date().toISOString();
-  return {
-    step: "Q1",
-    answers: {},
-    startedAt: now,
-    lastActivityAt: now,
-  };
+  return { step: "Q1", answers: {}, startedAt: now, lastActivityAt: now };
 }
 
 async function loadSession(
@@ -138,11 +176,9 @@ async function checkRateLimit(from: string, env: Env): Promise<boolean> {
       })()
     : { timestamps: [] };
 
-  // Prune timestamps outside the sliding window
   record.timestamps = record.timestamps.filter((ts) => ts > windowStart);
 
   if (record.timestamps.length >= RATE_LIMIT_MAX) {
-    // Rate limited — do not record this attempt
     return false;
   }
 
@@ -153,38 +189,149 @@ async function checkRateLimit(from: string, env: Env): Promise<boolean> {
   return true;
 }
 
-// ─── TwiML ────────────────────────────────────────────────────────────────────
+// ─── TwiML Ack ────────────────────────────────────────────────────────────────
 
-function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function twimlResponse(message: string): Response {
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Message>${escapeXml(message)}</Message>\n</Response>`;
-  return new Response(xml, {
+// Returns an empty TwiML <Response/> to acknowledge the webhook immediately.
+// All outbound messages are sent via the Twilio REST API (see sendTwilioText /
+// sendQuestion below) so Twilio does not wait for us to compose a reply.
+function twimlAck(): Response {
+  return new Response('<?xml version="1.0" encoding="UTF-8"?>\n<Response/>', {
     status: 200,
     headers: { "Content-Type": "text/xml; charset=utf-8" },
   });
 }
 
+// ─── Twilio REST API Helpers ──────────────────────────────────────────────────
+
+function twilioBasicAuth(env: Env): string {
+  return "Basic " + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
+}
+
+// Creates a twilio/quick-reply Content template and returns its ContentSid.
+async function createContentTemplate(
+  step: ScreeningStep,
+  env: Env
+): Promise<string> {
+  const q = QUESTION_CONTENT[step];
+  const body = JSON.stringify({
+    friendly_name: `bot_${step.toLowerCase()}`,
+    types: {
+      "twilio/quick-reply": {
+        body: q.body,
+        actions: q.actions,
+      },
+    },
+  });
+
+  const res = await fetch("https://content.twilio.com/v1/Contents", {
+    method: "POST",
+    headers: {
+      Authorization: twilioBasicAuth(env),
+      "Content-Type": "application/json",
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Content API error ${res.status} for step ${step}: ${text}`
+    );
+  }
+
+  const data = (await res.json()) as { sid: string };
+  return data.sid;
+}
+
+// Returns the ContentSid for a question step, creating and caching it lazily.
+async function getContentSid(step: ScreeningStep, env: Env): Promise<string> {
+  const kvKey = `content_sid:${step}`;
+  const cached = await safeKvGet(env.BOT_KV, kvKey);
+  if (cached) return cached;
+
+  const sid = await createContentTemplate(step, env);
+  await safeKvPut(env.BOT_KV, kvKey, sid, {
+    expirationTtl: CONTENT_SID_KV_TTL,
+  });
+  console.log(`Content template created for ${step}: ${sid}`);
+  return sid;
+}
+
+// Sends a plain text WhatsApp message via the Twilio Messages REST API.
+async function sendTwilioText(
+  to: string,
+  body: string,
+  env: Env
+): Promise<void> {
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`;
+  const params = new URLSearchParams({
+    To: to,
+    From: env.TWILIO_WHATSAPP_FROM,
+    Body: body,
+  });
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: twilioBasicAuth(env),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params.toString(),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error(`Messages API error ${res.status} sending text: ${text}`);
+  }
+}
+
+// Sends a question with quick-reply buttons via the Twilio Messages REST API.
+async function sendQuestion(
+  to: string,
+  step: ScreeningStep,
+  env: Env
+): Promise<void> {
+  const contentSid = await getContentSid(step, env);
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`;
+  const params = new URLSearchParams({
+    To: to,
+    From: env.TWILIO_WHATSAPP_FROM,
+    ContentSid: contentSid,
+  });
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: twilioBasicAuth(env),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params.toString(),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error(
+      `Messages API error ${res.status} sending ${step} buttons: ${text}`
+    );
+  }
+}
+
 // ─── Result Webhook ───────────────────────────────────────────────────────────
 
-function postResultWebhook(payload: ResultPayload, env: Env): Promise<void> {
-  if (!env.MAKE_WEBHOOK_URL) return Promise.resolve();
-  return fetch(env.MAKE_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  })
-    .then(() => undefined)
-    .catch((err) => {
-      console.error("Result webhook POST failed:", err);
+async function postResultWebhook(
+  payload: ResultPayload,
+  env: Env
+): Promise<void> {
+  if (!env.MAKE_WEBHOOK_URL) return;
+  try {
+    await fetch(env.MAKE_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
     });
+  } catch (err) {
+    console.error("Result webhook POST failed:", err);
+  }
 }
 
 // ─── Bot Logic ────────────────────────────────────────────────────────────────
@@ -192,11 +339,9 @@ function postResultWebhook(payload: ResultPayload, env: Env): Promise<void> {
 async function passSession(
   from: string,
   session: SessionState,
-  env: Env,
-  ctx: ExecutionContext
-): Promise<string> {
+  env: Env
+): Promise<void> {
   const payload: ResultPayload = {
-    applicant_token: "",
     whatsapp_from: from,
     result: "pass",
     reason: "",
@@ -204,23 +349,26 @@ async function passSession(
     completed_at: new Date().toISOString(),
   };
 
-  await safeKvDelete(env.BOT_KV, `session:${from}`);
-  ctx.waitUntil(postResultWebhook(payload, env));
+  await Promise.all([
+    safeKvDelete(env.BOT_KV, `session:${from}`),
+    postResultWebhook(payload, env),
+  ]);
 
-  const handoff =
-    env.MARIA_WHATSAPP_HANDOFF_TEXT ?? "Please await further instructions.";
-  return `\u2705 You passed screening. Next step: ${handoff}`;
+  const link = env.MARIA_WA_ME_LINK ?? "Please await further instructions.";
+  await sendTwilioText(
+    from,
+    `\u2705 You passed screening! Next step: ${link}`,
+    env
+  );
 }
 
 async function failSession(
   from: string,
   session: SessionState,
   reason: string,
-  env: Env,
-  ctx: ExecutionContext
-): Promise<string> {
+  env: Env
+): Promise<void> {
   const payload: ResultPayload = {
-    applicant_token: "",
     whatsapp_from: from,
     result: "fail",
     reason,
@@ -228,166 +376,199 @@ async function failSession(
     completed_at: new Date().toISOString(),
   };
 
-  await safeKvDelete(env.BOT_KV, `session:${from}`);
-  ctx.waitUntil(postResultWebhook(payload, env));
+  await Promise.all([
+    safeKvDelete(env.BOT_KV, `session:${from}`),
+    postResultWebhook(payload, env),
+  ]);
 
-  return `Thanks for your time \u2014 not the best fit right now. Reason: ${reason}`;
+  await sendTwilioText(
+    from,
+    `Thanks for your time \u2014 not the best fit right now. Reason: ${reason}`,
+    env
+  );
+}
+
+// Normalises the input to match known button payload IDs and text fallbacks.
+// Returns a canonical string (payload ID or trimmed input) for switch matching.
+function resolveInput(raw: string): string {
+  // Already a known payload ID pattern (e.g. Q1_YES) — return as-is
+  if (/^Q[1-5]_[A-Z0-9]+$/.test(raw)) return raw;
+  return raw.toLowerCase();
 }
 
 async function handleStep(
   session: SessionState,
-  input: string,
+  rawInput: string,
   from: string,
-  env: Env,
-  ctx: ExecutionContext
-): Promise<string> {
+  env: Env
+): Promise<void> {
   const minHours = parseInt(env.MIN_WEEKLY_HOURS ?? "15", 10);
+  const input = resolveInput(rawInput);
 
   switch (session.step) {
     case "Q1": {
-      if (input === "1") {
-        session.answers.q1_team_role = "Yes";
+      if (input === "Q1_YES" || input === "yes" || input === "1") {
+        session.answers.q1_team_role = "yes";
         session.step = "Q2";
         await saveSession(from, session, env);
-        return QUESTION_PROMPTS.Q2;
+        await sendQuestion(from, "Q2", env);
+      } else if (input === "Q1_NO" || input === "no" || input === "2") {
+        session.answers.q1_team_role = "no";
+        await failSession(from, session, "Looking for marketplace/freelance work", env);
+      } else {
+        await sendTwilioText(from, "Please tap one of the buttons below.", env);
+        await sendQuestion(from, "Q1", env);
       }
-      if (input === "2") {
-        session.answers.q1_team_role = "No";
-        return failSession(
-          from,
-          session,
-          "Looking for marketplace/freelance work",
-          env,
-          ctx
-        );
-      }
-      return `Please reply with 1 or 2.\n\n${QUESTION_PROMPTS.Q1}`;
+      return;
     }
 
     case "Q2": {
-      if (input === "1") {
-        session.answers.q2_availability = "Full-time (30+ hrs/wk)";
+      if (input === "Q2_FT" || input.startsWith("full") || input === "1") {
+        session.answers.q2_availability = "full_time";
         session.step = "Q3";
         await saveSession(from, session, env);
-        return QUESTION_PROMPTS.Q3;
-      }
-      if (input === "2") {
-        session.answers.q2_availability = "Part-time (15\u201329 hrs/wk)";
+        await sendQuestion(from, "Q3", env);
+      } else if (input === "Q2_PT" || input.startsWith("part") || input === "2") {
+        session.answers.q2_availability = "part_time";
         if (minHours >= 30) {
-          return failSession(
-            from,
-            session,
-            "Insufficient weekly hours",
-            env,
-            ctx
-          );
+          await failSession(from, session, "Insufficient weekly hours", env);
+        } else {
+          session.step = "Q3";
+          await saveSession(from, session, env);
+          await sendQuestion(from, "Q3", env);
         }
-        session.step = "Q3";
-        await saveSession(from, session, env);
-        return QUESTION_PROMPTS.Q3;
+      } else if (input === "Q2_LOW" || input.startsWith("less") || input === "3") {
+        session.answers.q2_availability = "low";
+        await failSession(from, session, "Insufficient weekly hours", env);
+      } else {
+        await sendTwilioText(from, "Please tap one of the buttons below.", env);
+        await sendQuestion(from, "Q2", env);
       }
-      if (input === "3") {
-        session.answers.q2_availability = "Less than 15 hrs/wk";
-        return failSession(
-          from,
-          session,
-          "Insufficient weekly hours",
-          env,
-          ctx
-        );
-      }
-      return `Please reply with 1, 2, or 3.\n\n${QUESTION_PROMPTS.Q2}`;
+      return;
     }
 
     case "Q3": {
-      const q3Map: Record<string, string> = {
-        "1": "Immediately",
-        "2": "1\u20132 weeks",
-        "3": "1 month+",
-      };
-      const q3Answer = q3Map[input];
-      if (q3Answer) {
-        session.answers.q3_start_date = q3Answer;
+      if (input === "Q3_NOW" || input.startsWith("imm") || input === "1") {
+        session.answers.q3_start_date = "immediately";
         session.step = "Q4";
         await saveSession(from, session, env);
-        return QUESTION_PROMPTS.Q4;
+        await sendQuestion(from, "Q4", env);
+      } else if (input === "Q3_2W" || input.startsWith("1\u20132") || input.startsWith("1-2") || input === "2") {
+        session.answers.q3_start_date = "1_2_weeks";
+        session.step = "Q4";
+        await saveSession(from, session, env);
+        await sendQuestion(from, "Q4", env);
+      } else if (input === "Q3_1M" || input.startsWith("1 month") || input === "3") {
+        session.answers.q3_start_date = "1_month_plus";
+        session.step = "Q4";
+        await saveSession(from, session, env);
+        await sendQuestion(from, "Q4", env);
+      } else {
+        await sendTwilioText(from, "Please tap one of the buttons below.", env);
+        await sendQuestion(from, "Q3", env);
       }
-      return `Please reply with 1, 2, or 3.\n\n${QUESTION_PROMPTS.Q3}`;
+      return;
     }
 
     case "Q4": {
-      if (input === "1") {
-        session.answers.q4_setup = "Yes";
+      if (input === "Q4_YES" || input === "yes" || input === "1") {
+        session.answers.q4_setup = "yes";
         session.step = "Q5";
         await saveSession(from, session, env);
-        return QUESTION_PROMPTS.Q5;
+        await sendQuestion(from, "Q5", env);
+      } else if (input === "Q4_NO" || input === "no" || input === "2") {
+        session.answers.q4_setup = "no";
+        await failSession(from, session, "No suitable teaching setup", env);
+      } else {
+        await sendTwilioText(from, "Please tap one of the buttons below.", env);
+        await sendQuestion(from, "Q4", env);
       }
-      if (input === "2") {
-        session.answers.q4_setup = "No";
-        return failSession(
-          from,
-          session,
-          "No suitable teaching setup",
-          env,
-          ctx
-        );
-      }
-      return `Please reply with 1 or 2.\n\n${QUESTION_PROMPTS.Q4}`;
+      return;
     }
 
     case "Q5": {
-      if (input === "1") {
-        session.answers.q5_curriculum = "Yes";
-        return passSession(from, session, env, ctx);
+      if (input === "Q5_YES" || input === "yes" || input === "1") {
+        session.answers.q5_curriculum = "yes";
+        await passSession(from, session, env);
+      } else if (input === "Q5_NO" || input === "no" || input === "2") {
+        session.answers.q5_curriculum = "no";
+        await failSession(from, session, "Unwilling to follow curriculum", env);
+      } else {
+        await sendTwilioText(from, "Please tap one of the buttons below.", env);
+        await sendQuestion(from, "Q5", env);
       }
-      if (input === "2") {
-        session.answers.q5_curriculum = "No";
-        return failSession(
-          from,
-          session,
-          "Unwilling to follow curriculum",
-          env,
-          ctx
-        );
-      }
-      return `Please reply with 1 or 2.\n\n${QUESTION_PROMPTS.Q5}`;
+      return;
     }
-
-    default:
-      return "Hi! Reply START to begin the 2-minute screening.";
   }
 }
 
-async function processMessage(
+// processAndSend runs entirely inside ctx.waitUntil() — the webhook has already
+// returned <Response/> before this executes. All user-facing output goes via
+// sendTwilioText() or sendQuestion().
+async function processAndSend(
   from: string,
-  body: string,
-  env: Env,
-  ctx: ExecutionContext
-): Promise<string> {
-  const trimmed = body.trim();
-  const upper = trimmed.toUpperCase();
-
-  // RESTART is always available regardless of session state
-  if (upper === "RESTART") {
-    await safeKvDelete(env.BOT_KV, `session:${from}`);
-    const session = createSession();
-    await saveSession(from, session, env);
-    return `Session restarted.\n\n${QUESTION_PROMPTS.Q1}`;
-  }
-
-  // Load existing session
-  const session = await loadSession(from, env);
-
-  if (!session) {
-    if (upper.includes("START")) {
-      const newSession = createSession();
-      await saveSession(from, newSession, env);
-      return QUESTION_PROMPTS.Q1;
+  buttonPayload: string | null,
+  buttonText: string | null,
+  rawBody: string,
+  env: Env
+): Promise<void> {
+  try {
+    // Rate limit
+    const allowed = await checkRateLimit(from, env);
+    if (!allowed) {
+      await sendTwilioText(
+        from,
+        "You\u2019re sending messages too quickly. Please wait a moment and try again.",
+        env
+      );
+      return;
     }
-    return "Hi! Reply START to begin the 2-minute screening.";
-  }
 
-  return handleStep(session, trimmed, from, env, ctx);
+    // Prefer ButtonPayload > ButtonText > Body
+    const input = (buttonPayload || buttonText || rawBody).trim();
+    const upper = input.toUpperCase();
+
+    // RESTART is always honoured regardless of session state
+    if (upper === "RESTART") {
+      await safeKvDelete(env.BOT_KV, `session:${from}`);
+      const session = createSession();
+      await saveSession(from, session, env);
+      await sendTwilioText(from, "Session restarted. Here\u2019s Q1:", env);
+      await sendQuestion(from, "Q1", env);
+      return;
+    }
+
+    // Load existing session
+    const session = await loadSession(from, env);
+
+    if (!session) {
+      if (upper.includes("START")) {
+        const newSession = createSession();
+        await saveSession(from, newSession, env);
+        await sendQuestion(from, "Q1", env);
+      } else {
+        await sendTwilioText(
+          from,
+          "Hi! Reply START to begin the 2-minute screening.",
+          env
+        );
+      }
+      return;
+    }
+
+    await handleStep(session, input, from, env);
+  } catch (err) {
+    console.error("processAndSend error:", err);
+    try {
+      await sendTwilioText(
+        from,
+        "Something went wrong on our end. Reply RESTART to begin again.",
+        env
+      );
+    } catch {
+      // swallow — nothing more we can do
+    }
+  }
 }
 
 // ─── Request Handlers ─────────────────────────────────────────────────────────
@@ -401,24 +582,22 @@ async function handleWhatsApp(
   const params = new URLSearchParams(bodyText);
 
   const from = params.get("From") ?? "";
+  // Twilio button reply params (see Twilio docs — ButtonPayload is preferred)
+  const buttonPayload = params.get("ButtonPayload");
+  const buttonText = params.get("ButtonText");
   const rawBody = params.get("Body") ?? "";
 
   if (!from) {
-    return twimlResponse(
-      "Sorry, something went wrong. Please try again."
-    );
+    // No sender — ack and log; we can't send an outbound message without a To
+    console.error("Webhook received without From param");
+    return twimlAck();
   }
 
-  // Rate limit check
-  const allowed = await checkRateLimit(from, env);
-  if (!allowed) {
-    return twimlResponse(
-      "You\u2019re sending messages too quickly. Please wait a moment and try again."
-    );
-  }
+  // Kick off all processing and outbound messaging asynchronously so Twilio
+  // receives the HTTP 200 ack immediately without waiting for our logic.
+  ctx.waitUntil(processAndSend(from, buttonPayload, buttonText, rawBody, env));
 
-  const reply = await processMessage(from, rawBody, env, ctx);
-  return twimlResponse(reply);
+  return twimlAck();
 }
 
 async function handleRequest(
@@ -453,9 +632,7 @@ export default {
       return await handleRequest(request, env, ctx);
     } catch (err) {
       console.error("Unhandled error:", err);
-      return twimlResponse(
-        "Sorry, something went wrong. Reply RESTART to begin again, or try again later."
-      );
+      return twimlAck();
     }
   },
 };

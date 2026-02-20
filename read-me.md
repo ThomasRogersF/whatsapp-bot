@@ -1,81 +1,207 @@
-Build a Cloudflare Worker (TypeScript) to power a user-initiated WhatsApp screening bot via Twilio WhatsApp Sandbox.
+# Twilio WhatsApp Screening Bot — Cloudflare Worker
 
-GOAL
-- Twilio WhatsApp Sandbox sends inbound messages to our Worker via webhook (HTTP POST).
-- Worker parses x-www-form-urlencoded payload (From, To, Body, etc.).
-- Bot runs a 5-question screening flow with simple text replies and numeric choices.
-- Store per-user session state in Cloudflare KV with TTL 7 days.
-- On PASS/FAIL, POST results to MAKE_WEBHOOK_URL (fire-and-forget) and clear session.
-- Return TwiML XML response to Twilio on every inbound message to send the user a reply.
+A Cloudflare Worker that runs a 5-question WhatsApp screening flow via Twilio.
+Candidates tap **quick-reply buttons** to answer; results are POSTed to a Make.com (or any) webhook on completion.
 
-TECH
-- Cloudflare Workers TypeScript
-- KV namespace binding: BOT_KV
-- Env vars:
-  - MAKE_WEBHOOK_URL (optional; if unset just skip)
-  - MARIA_WHATSAPP_HANDOFF_TEXT (text to display on PASS, e.g. “Thanks! Please message Maria at +1... or book: ...”)
-  - MIN_WEEKLY_HOURS (default 15)
+---
 
-ENDPOINTS
-- POST /whatsapp (Twilio webhook hits here)
-- GET /health returns “ok”
+## Architecture
 
-INBOUND FORMAT
-Twilio will send application/x-www-form-urlencoded with keys like:
-- From: "whatsapp:+15551234567"
-- To: "whatsapp:+14155238886"
-- Body: "START"
-We must parse it using await request.text() + URLSearchParams.
+```
+WhatsApp user
+    │  (button tap or text)
+    ▼
+Twilio ──► POST /whatsapp (Cloudflare Worker)
+               │
+               ├─ Returns <Response/> immediately (HTTP 200 ack)
+               │
+               └─ ctx.waitUntil(processAndSend(...))
+                      │
+                      ├─ Rate-limit check (KV sliding window)
+                      ├─ Parse ButtonPayload / ButtonText / Body
+                      ├─ Load/save session state (KV, TTL 7 days)
+                      ├─ State machine Q1 → Q2 → Q3 → Q4 → Q5
+                      │
+                      ├─ Outbound question  ──► Twilio Messages API (ContentSid)
+                      │       └─ Content template (twilio/quick-reply, lazy-created, KV-cached 1 yr)
+                      │
+                      └─ PASS/FAIL text     ──► Twilio Messages API (plain Body)
+                              └─ POST result payload ──► MAKE_WEBHOOK_URL
+```
 
-BOT FLOW (text-based with numbered choices)
-- If no session exists:
-  - If Body contains "START" (case-insensitive), begin screening.
-  - Else reply: "Hi! Reply START to begin the 2-minute screening."
-Questions (store answers):
-Q1) Are you looking for a TEAM role (not marketplace/freelance italki/Preply)?
-  1) Yes
-  2) No  -> FAIL
-Q2) Weekly availability?
-  1) Full-time (30+ hrs/wk)
-  2) Part-time (15–29 hrs/wk)
-  3) Less than 15 hrs/wk -> FAIL (or below MIN_WEEKLY_HOURS)
-Q3) When can you start?
-  1) Immediately
-  2) 1–2 weeks
-  3) 1 month+
-Q4) Do you have stable internet + quiet teaching setup?
-  1) Yes
-  2) No -> FAIL
-Q5) Willing to follow curriculum/SOPs?
-  1) Yes
-  2) No -> FAIL
+---
 
-PASS MESSAGE
-- "✅ You passed screening. Next step: {MARIA_WHATSAPP_HANDOFF_TEXT}"
+## Screening Flow
 
-FAIL MESSAGE
-- "Thanks for your time — not the best fit right now. Reason: <reason>"
+| Step | Question | Buttons | Payload IDs | Fail condition |
+|------|----------|---------|-------------|----------------|
+| Q1 | Team role? | Yes / No | `Q1_YES` / `Q1_NO` | `Q1_NO` → fail |
+| Q2 | Weekly availability? | Full-time / Part-time / Less than 15 hrs | `Q2_FT` / `Q2_PT` / `Q2_LOW` | `Q2_LOW` or `Q2_PT` when `MIN_WEEKLY_HOURS ≥ 30` → fail |
+| Q3 | Start date? | Immediately / 1–2 weeks / 1 month+ | `Q3_NOW` / `Q3_2W` / `Q3_1M` | None (always advances) |
+| Q4 | Setup? | Yes / No | `Q4_YES` / `Q4_NO` | `Q4_NO` → fail |
+| Q5 | Follow curriculum? | Yes / No | `Q5_YES` / `Q5_NO` | `Q5_NO` → fail |
 
-RESULT WEBHOOK
-On completion (pass/fail), send POST to MAKE_WEBHOOK_URL:
+**Keywords (type at any time):**
+- `START` — begin a new screening session
+- `RESTART` — clear session and restart from Q1
+
+---
+
+## Canonical Answer Values (stored in session)
+
+| Field | Values |
+|-------|--------|
+| `q1_team_role` | `"yes"` \| `"no"` |
+| `q2_availability` | `"full_time"` \| `"part_time"` \| `"low"` |
+| `q3_start_date` | `"immediately"` \| `"1_2_weeks"` \| `"1_month_plus"` |
+| `q4_setup` | `"yes"` \| `"no"` |
+| `q5_curriculum` | `"yes"` \| `"no"` |
+
+---
+
+## Result Webhook Payload
+
+On PASS or FAIL, the Worker POSTs to `MAKE_WEBHOOK_URL` (if set):
+
+```json
 {
-  applicant_token: "", (blank for sandbox)
-  whatsapp_from: "whatsapp:+1...",
-  result: "pass"|"fail",
-  reason: "",
-  answers: {...},
-  completed_at: ISO
+  "whatsapp_from": "whatsapp:+15551234567",
+  "result": "pass",
+  "reason": "",
+  "answers": {
+    "q1_team_role": "yes",
+    "q2_availability": "full_time",
+    "q3_start_date": "immediately",
+    "q4_setup": "yes",
+    "q5_curriculum": "yes"
+  },
+  "completed_at": "2026-01-15T10:30:00.000Z"
 }
-If MAKE_WEBHOOK_URL is missing, skip.
+```
 
-OTHER REQUIREMENTS
-- Always respond 200 with TwiML content-type "text/xml".
-- Add /restart: if Body is "RESTART" reset session.
-- Rate limit: 5 messages per 10 seconds per user (store a short sliding window in KV).
-- Robust error handling: never throw; on error, respond with generic help message.
+`reason` is an empty string on PASS and one of the following on FAIL:
+- `"Looking for marketplace/freelance work"`
+- `"Insufficient weekly hours"`
+- `"No suitable teaching setup"`
+- `"Unwilling to follow curriculum"`
 
-DELIVERABLES
-- src/index.ts Worker
-- wrangler.toml example with KV binding and vars
-- package.json + tsconfig.json for Wrangler
-- Deployment commands (wrangler login, kv create, secret put, deploy)
+---
+
+## Environment Variables & Secrets
+
+### `wrangler.toml` vars (non-sensitive, commit freely)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MIN_WEEKLY_HOURS` | Minimum weekly hours for part-time acceptance | `"15"` |
+| `TWILIO_WHATSAPP_FROM` | Twilio sender in `"whatsapp:+57xxx"` format | *(set to your number)* |
+| `MARIA_WA_ME_LINK` | URL shown to PASS candidates | *(set to your link)* |
+
+### Secrets (set via `wrangler secret put`)
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `TWILIO_ACCOUNT_SID` | **Yes** | Starts with `"AC..."` — Twilio Console dashboard |
+| `TWILIO_AUTH_TOKEN` | **Yes** | Twilio Console dashboard |
+| `MAKE_WEBHOOK_URL` | No | Result webhook URL; omit to skip POSTing results |
+
+---
+
+## KV Namespace Keys
+
+| Key pattern | Purpose | TTL |
+|-------------|---------|-----|
+| `session:{from}` | Per-user session state | 7 days |
+| `ratelimit:{from}` | Rate-limit timestamps | 60 s |
+| `content_sid:{step}` | Cached Twilio Content template SID | 1 year |
+
+Content templates (`content_sid:Q1` … `content_sid:Q5`) are created automatically via the Twilio Content API the first time each question is sent, then cached in KV for one year.  No manual template setup is required.
+
+---
+
+## Deployment
+
+### 1. Prerequisites
+
+```bash
+npm install -g wrangler
+wrangler login
+```
+
+### 2. Create KV namespaces
+
+```bash
+wrangler kv:namespace create BOT_KV
+# copy the printed id → paste into wrangler.toml [[kv_namespaces]] id
+
+wrangler kv:namespace create BOT_KV --preview
+# copy the printed preview_id → paste into wrangler.toml preview_id
+```
+
+### 3. Set secrets
+
+```bash
+wrangler secret put TWILIO_ACCOUNT_SID
+wrangler secret put TWILIO_AUTH_TOKEN
+wrangler secret put MAKE_WEBHOOK_URL      # optional
+```
+
+### 4. Update `wrangler.toml`
+
+Edit the `[vars]` section:
+```toml
+TWILIO_WHATSAPP_FROM = "whatsapp:+57xxxxxxxxxx"
+MARIA_WA_ME_LINK     = "https://wa.me/57xxxxxxxxxx?text=Hi%20Maria..."
+```
+
+### 5. Deploy
+
+```bash
+npm run deploy
+# or: wrangler deploy
+```
+
+### 6. Configure Twilio webhook
+
+In the Twilio Console:
+
+**For WhatsApp Sandbox (testing):**
+Messaging → Try it out → Send a WhatsApp message → Sandbox Settings
+Set **"A message comes in"** to:
+```
+https://twilio-whatsapp-bot.<your-account>.workers.dev/whatsapp
+```
+Method: **HTTP POST**
+
+**For production (Messaging Service):**
+Messaging → Services → `<your service>` → Integration
+Set the inbound webhook URL as above.
+
+### 7. Verify
+
+```bash
+wrangler tail   # stream live logs
+```
+
+Send `START` to your WhatsApp sandbox number.
+On the first message, the Worker creates the 5 Content templates via the Twilio Content API and caches their SIDs.  All subsequent messages use the cached SIDs with no extra API calls.
+
+---
+
+## Local Development
+
+```bash
+wrangler dev
+```
+
+> **Note:** Interactive button testing requires a real Twilio webhook.
+> Local dev mode can be used to verify health checks and basic request parsing, but you'll need `ngrok` (or similar) + the Twilio Sandbox pointed at your tunnel to test the full button flow.
+
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Returns `ok` (health check) |
+| `POST` | `/whatsapp` | Twilio webhook — returns empty `<Response/>` immediately |

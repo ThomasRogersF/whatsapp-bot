@@ -12,16 +12,30 @@ preview_id = "1c7c788345da4a19911f869d2211b58a"
 
 # ─── Environment Variables ────────────────────────────────────────────────────
 [vars]
+# Minimum weekly hours threshold for Q2 part-time acceptance (default 15).
 MIN_WEEKLY_HOURS = "15"
-# Secrets (do NOT put sensitive values here — use `wrangler secret put` instead):
+
+# Your Twilio WhatsApp sender number in E.164 format, prefixed with "whatsapp:".
+# Must match the number registered in your Twilio Sandbox or approved sender.
+TWILIO_WHATSAPP_FROM = "whatsapp:+57xxxxxxxxxx"
+
+# Link sent to candidates who PASS screening (e.g. a wa.me deep-link to Maria).
+# Example: "https://wa.me/57xxxxxxxxxx?text=Hi%20Maria%2C%20I%20passed%20screening!"
+MARIA_WA_ME_LINK = "https://wa.me/57xxxxxxxxxx?text=Hi%20Maria..."
+
+# ─── Secrets ──────────────────────────────────────────────────────────────────
+# The following values must be set as Cloudflare Worker secrets (never committed
+# to source control). Run each command and paste the value when prompted:
 #
-#   wrangler secret put MAKE_WEBHOOK_URL
+#   wrangler secret put TWILIO_ACCOUNT_SID
+#     -> Your Twilio Account SID (starts with "AC...").
+#
+#   wrangler secret put TWILIO_AUTH_TOKEN
+#     -> Your Twilio Auth Token (found in the Twilio Console dashboard).
+#
+#   wrangler secret put MAKE_WEBHOOK_URL          (optional)
 #     -> The Make.com (or other) webhook URL to POST screening results to.
-#        Leave unset to skip the result webhook entirely.
-#
-#   wrangler secret put MARIA_WHATSAPP_HANDOFF_TEXT
-#     -> Text displayed to candidates who PASS screening.
-#        Example: "Please message Maria at +1 (555) 000-0000 or book at https://calendly.com/..."
+#        If unset, result POSTing is skipped and only the session is cleared.
 
 # ─── Deployment Commands ──────────────────────────────────────────────────────
 # 1. Authenticate:
@@ -35,18 +49,27 @@ MIN_WEEKLY_HOURS = "15"
 #      wrangler kv:namespace create BOT_KV --preview
 #      -> Copy the printed id into [[kv_namespaces]] preview_id above
 #
-# 4. Set secrets:
-#      wrangler secret put MAKE_WEBHOOK_URL
-#      wrangler secret put MARIA_WHATSAPP_HANDOFF_TEXT
+# 4. Set required secrets:
+#      wrangler secret put TWILIO_ACCOUNT_SID
+#      wrangler secret put TWILIO_AUTH_TOKEN
 #
-# 5. Deploy:
+# 5. Set optional secrets:
+#      wrangler secret put MAKE_WEBHOOK_URL
+#
+# 6. Update vars above (TWILIO_WHATSAPP_FROM, MARIA_WA_ME_LINK) with real values.
+#
+# 7. Deploy:
 #      wrangler deploy
 #
-# 6. View live logs:
+# 8. View live logs:
 #      wrangler tail
 #
-# 7. Local development server:
+# 9. Local development server:
 #      wrangler dev
 #
-# After deploying, set your Twilio WhatsApp Sandbox webhook URL to:
-#   https://twilio-whatsapp-bot.<your-account>.workers.dev/whatsapp
+# After deploying, configure the Twilio webhook:
+#   Twilio Console → Messaging → Try it out → Send a WhatsApp message
+#   OR Messaging → Services → <your service> → Integration
+#   Set "A message comes in" webhook URL to:
+#     https://twilio-whatsapp-bot.<your-account>.workers.dev/whatsapp
+#   Method: HTTP POST
