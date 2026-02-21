@@ -13,7 +13,7 @@ export interface Env {
   MIN_WEEKLY_HOURS?: string;
 }
 
-type ScreeningStep = "INTRO" | "Q1" | "Q2" | "Q3" | "Q4" | "Q5" | "Q6";
+type ScreeningStep = "Q1" | "Q2" | "Q3" | "Q4" | "Q5" | "Q6" | "Q7" | "Q8";
 
 interface Answers {
   team_role?: "yes" | "no";
@@ -22,6 +22,8 @@ interface Answers {
   setup?: "yes" | "no";
   sop?: "yes" | "no";
   english_level?: "good" | "ok" | "low";
+  age?: number;
+  student_types?: "kids" | "teens" | "adults" | "all";
 }
 
 interface SessionState {
@@ -52,24 +54,36 @@ const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_KV_TTL = 60;          // 60 seconds (KV minimum)
 
 const QUESTION_TEXT: Record<ScreeningStep, string> = {
-  INTRO: "👋 ¡Hola! Gracias por postularte para ser *Profesor/a de Español* en *SpanishVIP* 🇪🇸✨\n\n🕒 Esto es un *pre-filtro rápido (2 minutos)* para confirmar algunos requisitos básicos.\n\n✅ Para responder, escribe el *número* de la opción (por ejemplo: *1*) o la palabra clave indicada.\n\n💡 _Tip:_ Responde con calma, un mensaje por pregunta 😊\n\n¿List@? Responde:\n1) Empezar 🚀\n2) Salir ❌",
-  Q1: "*Q1/6* 🧩\nEn SpanishVIP buscamos un rol de *equipo* (no estilo marketplace como italki/Preply).\n\n¿Buscas un rol fijo y comprometido con el equipo?\n1) ✅ Sí, quiero ser parte del equipo\n2) ❌ No, solo freelance / marketplace",
-  Q2: "*Q2/6* 🗓️\n¿Cuántas horas por semana puedes comprometerte de forma constante?\n1) 💪 Tiempo completo (30+ hrs/sem)\n2) 🙂 Medio tiempo (15–29 hrs/sem)\n3) 🥲 Menos de 15 hrs/sem\n\nTambién puedes escribir: FT / PT / LOW",
-  Q3: "*Q3/6* ⏱️\n¿Cuándo podrías empezar?\n1) 🚀 Inmediatamente\n2) 📆 En 1–2 semanas\n3) 🗓️ En 1 mes o más\n\nTambién puedes escribir: NOW / 2WEEKS / 1MONTH",
-  Q4: "*Q4/6* 💻🎧\n¿Tienes internet estable + un lugar tranquilo para enseñar?\n1) ✅ Sí\n2) ❌ No",
-  Q5: "*Q5/6* 📚✨\n¿Estás de acuerdo en seguir el currículum y los SOPs del equipo?\n1) ✅ Sí, claro\n2) ❌ No",
-  Q6: "*Q6/6* 🇺🇸🗣️\nPara coordinarnos mejor en el equipo, necesitamos un nivel mínimo de inglés.\n\n¿Cuál es tu nivel de inglés?\n1) ✅ Bueno (puedo conversar con confianza)\n2) 🙂 Me defiendo (puedo comunicarme lo básico)\n3) ❌ No sé mucho",
+  Q1: "*Q1/8* \uD83E\uDDE9\nEn SpanishVIP buscamos un rol de *equipo* (no estilo marketplace).\n\u00BFBuscas un rol fijo y comprometido con el equipo?\n1) \u2705 S\u00ED\n2) \u274C No",
+  Q2: "*Q2/8* \uD83D\uDDD3\uFE0F\n\u00BFCu\u00E1ntas horas por semana puedes comprometerte de forma constante?\n1) \uD83D\uDCAA Tiempo completo (30+ hrs/sem)\n2) \uD83D\uDE42 Medio tiempo (15\u201329 hrs/sem)\n3) \uD83E\uDD72 Menos de 15 hrs/sem",
+  Q3: "*Q3/8* \u23F1\uFE0F\n\u00BFCu\u00E1ndo podr\u00EDas empezar?\n1) \uD83D\uDE80 Inmediatamente\n2) \uD83D\uDCC6 En 1\u20132 semanas\n3) \uD83D\uDDD3\uFE0F En 1 mes o m\u00E1s",
+  Q4: "*Q4/8* \uD83D\uDCBB\uD83C\uDFA7\n\u00BFTienes internet estable + un lugar tranquilo para ense\u00F1ar?\n1) \u2705 S\u00ED\n2) \u274C No",
+  Q5: "*Q5/8* \uD83D\uDCDA\u2728\n\u00BFEst\u00E1s de acuerdo en seguir el curr\u00EDculum y los SOPs del equipo?\n1) \u2705 S\u00ED\n2) \u274C No",
+  Q6: "*Q6/8* \uD83C\uDDFA\uD83C\uDDF8\uD83D\uDDE3\uFE0F\n\u00BFCu\u00E1l es tu nivel de ingl\u00E9s?\n1) \u2705 Bueno\n2) \uD83D\uDE42 Me defiendo\n3) \u274C No s\u00E9 mucho",
+  Q7: "*Q7/8* \uD83C\uDF82\n\u00BFCu\u00E1l es tu edad?\n(Escribe solo el n\u00FAmero, por ejemplo: 24)",
+  Q8: "*Q8/8* \uD83D\uDC69\u200D\uD83C\uDFEB\n\u00BFA qu\u00E9 tipo de estudiantes has ense\u00F1ado?\n1) Ni\u00F1os \uD83D\uDC67\uD83E\uDDD2\n2) J\u00F3venes \uD83C\uDF93\n3) Adultos \uD83D\uDCBC\n4) Todos los anteriores \uD83C\uDF1F",
+};
+
+// Short per-question invalid-input hints (sent together with the question resend).
+const INVALID_HINT: Record<ScreeningStep, string> = {
+  Q1: "\uD83D\uDE0A Responde solo con 1 o 2.",
+  Q2: "\uD83D\uDE0A Responde solo con 1, 2 o 3.",
+  Q3: "\uD83D\uDE0A Responde solo con 1, 2 o 3.",
+  Q4: "\uD83D\uDE0A Responde solo con 1 o 2.",
+  Q5: "\uD83D\uDE0A Responde solo con 1 o 2.",
+  Q6: "\uD83D\uDE0A Responde solo con 1, 2 o 3.",
+  Q7: "\uD83D\uDE0A Por favor escribe tu edad en n\u00FAmeros (ej: 24).",
+  Q8: "\uD83D\uDE0A Responde solo con 1, 2, 3 o 4.",
 };
 
 const FAIL_MESSAGES = {
-  Q1: "💛 Gracias por tu sinceridad.\nEn este momento estamos buscando *miembros de equipo* con compromiso y disponibilidad constante.\n\n🙏 Te deseamos lo mejor y gracias por postularte.",
-  Q2: "💛 ¡Gracias!\nPor ahora necesitamos mínimo *15 horas/semana* de disponibilidad constante.\n\n🙏 Te agradecemos tu tiempo y tu interés en SpanishVIP.",
-  Q4: "💛 Gracias por tu respuesta.\nPara poder dar clases con calidad, necesitamos *internet estable* y un *espacio tranquilo*.\n\n🙏 Te agradecemos tu tiempo.",
-  Q5: "💛 Gracias por tu sinceridad.\nPara este rol es importante seguir nuestro sistema y procesos.\n\n🙏 Te deseamos lo mejor y gracias por postularte.",
-  Q6: "💛 ¡Gracias!\nPor ahora necesitamos al menos un nivel de inglés para comunicarnos en el equipo (aunque sea _“me defiendo”_).\n\n🙏 Te agradecemos tu tiempo y tu interés en SpanishVIP.",
+  Q1: "\uD83D\uDCDB Gracias por tu sinceridad.\nEn este momento estamos buscando *miembros de equipo* con compromiso y disponibilidad constante.\n\n\uD83D\uDE4F Te deseamos lo mejor y gracias por postularte.",
+  Q2: "\uD83D\uDCDB \u00A1Gracias!\nPor ahora necesitamos m\u00EDnimo *15 horas/semana* de disponibilidad constante.\n\n\uD83D\uDE4F Te agradecemos tu tiempo y tu inter\u00E9s en SpanishVIP.",
+  Q4: "\uD83D\uDCDB Gracias por tu respuesta.\nPara poder dar clases con calidad, necesitamos *internet estable* y un *espacio tranquilo*.\n\n\uD83D\uDE4F Te agradecemos tu tiempo.",
+  Q5: "\uD83D\uDCDB Gracias por tu sinceridad.\nPara este rol es importante seguir nuestro sistema y procesos.\n\n\uD83D\uDE4F Te deseamos lo mejor y gracias por postularte.",
+  Q6: "\uD83D\uDCDB \u00A1Gracias!\nPor ahora necesitamos al menos un nivel de ingl\u00E9s para comunicarnos en el equipo (aunque sea _\"me defiendo\"_).\n\n\uD83D\uDE4F Te agradecemos tu tiempo y tu inter\u00E9s en SpanishVIP.",
+  Q7: "\uD83D\uDCDB \u00A1Gracias!\nEn este momento estamos buscando candidatos *menores de 35 a\u00F1os* para este rol.\n\n\uD83D\uDE4F Te agradecemos tu tiempo y tu inter\u00E9s en SpanishVIP.",
 };
-
-const INVALID_INPUT_MESSAGE = "😊 ¡Casi!\nPor favor responde con el *número* de una opción (por ejemplo: *1*) o con la palabra clave.\n\n✨ Si quieres reiniciar, escribe: *RESTART*\n🚀 Para empezar desde cero, escribe: *START*";
 
 // ─── Text Sanitization ────────────────────────────────────────────────────────
 
@@ -120,7 +134,7 @@ async function safeKvDelete(kv: KVNamespace, key: string): Promise<void> {
 
 function createSession(): SessionState {
   const now = new Date().toISOString();
-  return { step: "INTRO", answers: {}, startedAt: now, lastActivityAt: now };
+  return { step: "Q1", answers: {}, startedAt: now, lastActivityAt: now };
 }
 
 async function loadSession(
@@ -271,12 +285,18 @@ async function passSession(
   };
 
   await Promise.all([
-    saveSession(from, session, env), // Keep session marked as completed
+    saveSession(from, session, env),
     postResultWebhook(payload, env),
   ]);
 
   const link = env.MARIA_WA_ME_LINK ?? "https://wa.me/57xxxxxxxxxx";
-  const passMsg = `🎉 *¡Excelente! Has pasado el pre-filtro* ✅\n\n🧑💼 Siguiente paso: hablar con una persona del equipo para coordinar tu *primera entrevista*.\n\n👉 Escribe aquí a *Maria Camila* para continuar:\n${link}\n\n💬 _Por favor envía este mensaje cuando le escribas:_\n“Hola Maria, pasé el pre-filtro de SpanishVIP. Mi nombre es ___ y mi correo es ___.”\n\n💛 ¡Gracias y nos vemos pronto!`;
+  const passMsg =
+    "\uD83C\uDF89 *\u00A1Excelente! Has pasado el pre-filtro* \u2705\n\n" +
+    "\uD83E\uDDD1\u200D\uD83D\uDCBC Siguiente paso: hablar con una persona del equipo para coordinar tu *primera entrevista*.\n\n" +
+    "\uD83D\uDC49 Escribe aqu\u00ED a *Maria Camila* para continuar:\n" +
+    link + "\n\n" +
+    "\uD83D\uDCAC _Mensaje sugerido:_\n" +
+    '"Hola Maria, pas\u00E9 el pre-filtro de SpanishVIP. Mi nombre es ___ y mi correo es ___."';
 
   await sendTwilioText(from, passMsg, env);
 }
@@ -298,12 +318,24 @@ async function failSession(
   };
 
   await Promise.all([
-    saveSession(from, session, env), // Keep session marked as completed
+    saveSession(from, session, env),
     postResultWebhook(payload, env),
   ]);
 
   const failMsg = FAIL_MESSAGES[stepKey];
   await sendTwilioText(from, failMsg, env);
+}
+
+// Sends a short step-specific invalid-input hint followed by the question again,
+// combined into one message to minimise outbound message cost.
+async function sendInvalidInput(
+  from: string,
+  step: ScreeningStep,
+  env: Env
+): Promise<void> {
+  const hint = INVALID_HINT[step];
+  const question = QUESTION_TEXT[step];
+  await sendTwilioText(from, `${hint}\n\n${question}`, env);
 }
 
 // Normalises the input to match known keywords and numeric options.
@@ -328,22 +360,8 @@ async function handleStep(
   );
 
   switch (session.step) {
-    case "INTRO": {
-      if (input === "1" || input === "EMPEZAR" || input === "EMPEZAR 🚀") {
-        session.step = "Q1";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q1"], env);
-      } else if (input === "2" || input === "SALIR" || input === "SALIR ❌") {
-        await safeKvDelete(env.BOT_KV, `session:${from}`);
-        await sendTwilioText(from, "Entendido. Si quieres empezar más tarde, simplemente escribe *START*.", env);
-      } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
-      }
-      return;
-    }
-
     case "Q1": {
-      const isYes = ["1", "YES", "SI", "SÍ", "Y"].includes(input);
+      const isYes = ["1", "YES", "SI", "S\u00CD", "Y"].includes(input);
       const isNo = ["2", "NO", "N"].includes(input);
 
       if (isYes) {
@@ -355,7 +373,7 @@ async function handleStep(
         session.answers.team_role = "no";
         await failSession(from, session, "Q1", "not team role", env);
       } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
+        await sendInvalidInput(from, "Q1", env);
       }
       return;
     }
@@ -391,7 +409,7 @@ async function handleStep(
           await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
         }
       } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
+        await sendInvalidInput(from, "Q2", env);
       }
       return;
     }
@@ -399,7 +417,7 @@ async function handleStep(
     case "Q3": {
       const isNow = ["1", "NOW", "INMEDIATO", "INMEDIATAMENTE"].includes(input);
       const isSoon = ["2", "2WEEKS", "SOON", "PRONTO", "1-2"].includes(input);
-      const isLater = ["3", "1MONTH", "LATER", "MAS", "MÁS", "1 MES"].includes(input);
+      const isLater = ["3", "1MONTH", "LATER", "MAS", "M\u00C1S", "1 MES"].includes(input);
 
       if (isNow) {
         session.answers.start_date = "now";
@@ -417,13 +435,13 @@ async function handleStep(
         await saveSession(from, session, env);
         await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
       } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
+        await sendInvalidInput(from, "Q3", env);
       }
       return;
     }
 
     case "Q4": {
-      const isYes = ["1", "YES", "SI", "SÍ"].includes(input);
+      const isYes = ["1", "YES", "SI", "S\u00CD"].includes(input);
       const isNo = ["2", "NO"].includes(input);
 
       if (isYes) {
@@ -435,13 +453,13 @@ async function handleStep(
         session.answers.setup = "no";
         await failSession(from, session, "Q4", "no stable setup", env);
       } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
+        await sendInvalidInput(from, "Q4", env);
       }
       return;
     }
 
     case "Q5": {
-      const isYes = ["1", "YES", "SI", "SÍ"].includes(input);
+      const isYes = ["1", "YES", "SI", "S\u00CD"].includes(input);
       const isNo = ["2", "NO"].includes(input);
 
       if (isYes) {
@@ -453,28 +471,66 @@ async function handleStep(
         session.answers.sop = "no";
         await failSession(from, session, "Q5", "not willing to follow SOP", env);
       } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
+        await sendInvalidInput(from, "Q5", env);
       }
       return;
     }
 
     case "Q6": {
       const isGood = ["1", "GOOD", "BUENO", "B1", "B2", "C1", "C2"].includes(input);
-      const isOk = ["2", "DEFENDERME", "ME DEFIENDO", "BASIC", "BASICO", "BÁSICO"].includes(input);
+      const isOk = ["2", "DEFENDERME", "ME DEFIENDO", "BASIC", "BASICO", "B\u00C1SICO"].includes(input);
       const isLow = ["3", "POCO", "NO MUCHO", "NO SE", "NO", "NADA"].includes(input);
 
       if (isGood) {
         session.answers.english_level = "good";
-        await passSession(from, session, env);
+        session.step = "Q7";
+        await saveSession(from, session, env);
+        await sendTwilioText(from, QUESTION_TEXT["Q7"], env);
       } else if (isOk) {
         session.answers.english_level = "ok";
-        await passSession(from, session, env);
+        session.step = "Q7";
+        await saveSession(from, session, env);
+        await sendTwilioText(from, QUESTION_TEXT["Q7"], env);
       } else if (isLow) {
         session.answers.english_level = "low";
         await failSession(from, session, "Q6", "english_low", env);
       } else {
-        await sendTwilioText(from, INVALID_INPUT_MESSAGE, env);
+        await sendInvalidInput(from, "Q6", env);
       }
+      return;
+    }
+
+    case "Q7": {
+      const ageNum = parseInt(rawInput.trim(), 10);
+      if (isNaN(ageNum) || ageNum <= 0 || ageNum > 120) {
+        await sendInvalidInput(from, "Q7", env);
+        return;
+      }
+      session.answers.age = ageNum;
+      if (ageNum >= 35) {
+        await failSession(from, session, "Q7", "age >= 35", env);
+      } else {
+        session.step = "Q8";
+        await saveSession(from, session, env);
+        await sendTwilioText(from, QUESTION_TEXT["Q8"], env);
+      }
+      return;
+    }
+
+    case "Q8": {
+      const studentTypeMap: Record<string, "kids" | "teens" | "adults" | "all"> = {
+        "1": "kids",
+        "2": "teens",
+        "3": "adults",
+        "4": "all",
+      };
+      const studentType = studentTypeMap[input];
+      if (!studentType) {
+        await sendInvalidInput(from, "Q8", env);
+        return;
+      }
+      session.answers.student_types = studentType;
+      await passSession(from, session, env);
       return;
     }
   }
@@ -496,7 +552,7 @@ async function processAndSend(
     if (!allowed) {
       await sendTwilioText(
         from,
-        "Estás enviando mensajes demasiado rápido. Por favor, espera un momento.",
+        "Est\u00E1s enviando mensajes demasiado r\u00E1pido. Por favor, espera un momento.",
         env
       );
       return;
@@ -516,14 +572,13 @@ async function processAndSend(
       `[processAndSend] from=${from} inputSource=${inputSource} rawInput="${input}"`
     );
 
-    // START and RESTART both clear the session and begin at INTRO.
+    // START and RESTART both clear the session and jump straight to Q1.
     if (upper === "START" || upper === "RESTART") {
       console.log(`[processAndSend] from=${from} command=${upper} — resetting session`);
       await safeKvDelete(env.BOT_KV, `session:${from}`);
       const newSession = createSession();
       await saveSession(from, newSession, env);
-
-      await sendTwilioText(from, QUESTION_TEXT["INTRO"], env);
+      await sendTwilioText(from, QUESTION_TEXT["Q1"], env);
       return;
     }
 
@@ -531,11 +586,8 @@ async function processAndSend(
     const session = await loadSession(from, env);
 
     if (!session) {
-      await sendTwilioText(
-        from,
-        "👋 ¡Hola! Para comenzar el proceso de pre-filtro para SpanishVIP, por favor escribe *START* 🚀",
-        env
-      );
+      // No active session — short prompt only.
+      await sendTwilioText(from, "Escribe START para comenzar \uD83D\uDE0A", env);
       return;
     }
 
@@ -551,7 +603,7 @@ async function processAndSend(
     try {
       await sendTwilioText(
         from,
-        "Lo sentimos, algo salió mal. Por favor, escribe *RESTART* para empezar de nuevo.",
+        "Lo sentimos, algo sali\u00F3 mal. Por favor, escribe *RESTART* para empezar de nuevo.",
         env
       );
     } catch {
