@@ -2,11 +2,9 @@
 
 export interface Env {
   BOT_KV: KVNamespace;
-  // Twilio credentials (secrets)
-  TWILIO_ACCOUNT_SID: string;
-  TWILIO_AUTH_TOKEN: string;
-  // Twilio sender number, e.g. "whatsapp:+57xxxxxxxxxx"
-  TWILIO_WHATSAPP_FROM: string;
+  // Green-API credentials
+  GREENAPI_ID_INSTANCE: string;   // Instance ID (numeric string), set in wrangler.toml [vars]
+  GREENAPI_API_TOKEN: string;     // API token (secret)
   // Optional
   MAKE_WEBHOOK_URL?: string;
   MARIA_WA_ME_LINK?: string;
@@ -87,7 +85,7 @@ const FAIL_MESSAGES = {
 
 // ─── Text Sanitization ────────────────────────────────────────────────────────
 
-// Replaces Unicode characters that can cause Twilio 63013 rendering failures:
+// Replaces Unicode characters that can cause WhatsApp rendering failures:
 //   em dash (U+2014) → hyphen
 //   curly single quotes (U+2018/U+2019) → straight apostrophe
 //   curly double quotes (U+201C/U+201D) → straight double quote
@@ -96,6 +94,15 @@ function sanitize(text: string): string {
     .replace(/\u2014/g, "-")
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"');
+}
+
+// ─── KV Key Helpers ───────────────────────────────────────────────────────────
+
+// Extracts the numeric phone digits from a Green-API chatId.
+// "573001234567@c.us" → "573001234567"
+// Strips everything from the first "@" onwards.
+function chatIdToDigits(chatId: string): string {
+  return chatId.replace(/@.*/, "");
 }
 
 // ─── KV Helpers ───────────────────────────────────────────────────────────────
@@ -137,11 +144,12 @@ function createSession(): SessionState {
   return { step: "Q1", answers: {}, startedAt: now, lastActivityAt: now };
 }
 
+// KV key for session storage: "wa:<digits>" e.g. "wa:573001234567"
 async function loadSession(
-  from: string,
+  chatId: string,
   env: Env
 ): Promise<SessionState | null> {
-  const raw = await safeKvGet(env.BOT_KV, `session:${from}`);
+  const raw = await safeKvGet(env.BOT_KV, `wa:${chatIdToDigits(chatId)}`);
   if (!raw) return null;
   try {
     return JSON.parse(raw) as SessionState;
@@ -151,20 +159,24 @@ async function loadSession(
 }
 
 async function saveSession(
-  from: string,
+  chatId: string,
   session: SessionState,
   env: Env
 ): Promise<void> {
   session.lastActivityAt = new Date().toISOString();
-  await safeKvPut(env.BOT_KV, `session:${from}`, JSON.stringify(session), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
+  await safeKvPut(
+    env.BOT_KV,
+    `wa:${chatIdToDigits(chatId)}`,
+    JSON.stringify(session),
+    { expirationTtl: SESSION_TTL_SECONDS }
+  );
 }
 
 // ─── Rate Limiting ────────────────────────────────────────────────────────────
 
-async function checkRateLimit(from: string, env: Env): Promise<boolean> {
-  const key = `ratelimit:${from}`;
+// KV key for rate-limit records: "rl:<digits>" e.g. "rl:573001234567"
+async function checkRateLimit(chatId: string, env: Env): Promise<boolean> {
+  const key = `rl:${chatIdToDigits(chatId)}`;
   const now = Date.now();
   const windowStart = now - RATE_LIMIT_WINDOW_MS;
 
@@ -192,60 +204,41 @@ async function checkRateLimit(from: string, env: Env): Promise<boolean> {
   return true;
 }
 
-// ─── TwiML Ack ────────────────────────────────────────────────────────────────
+// ─── Green-API REST Helper ────────────────────────────────────────────────────
 
-// Returns an empty TwiML <Response/> to acknowledge the webhook immediately.
-// All outbound messages are sent via the Twilio REST API (see sendTwilioText
-// below) so Twilio does not wait for us to compose a reply.
-function twimlAck(): Response {
-  return new Response('<?xml version="1.0" encoding="UTF-8"?>\n<Response/>', {
-    status: 200,
-    headers: { "Content-Type": "text/xml; charset=utf-8" },
-  });
-}
-
-// ─── Twilio REST API Helpers ──────────────────────────────────────────────────
-
-function twilioBasicAuth(env: Env): string {
-  return "Basic " + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
-}
-
-// Sends a plain text WhatsApp message via the Twilio Messages REST API.
-// Text is sanitized before sending to avoid 63013 rendering failures.
+// Sends a plain text WhatsApp message via the Green-API sendMessage endpoint.
+// toChatId must be in Green-API chatId format: "<digits>@c.us".
+// Text is sanitized before sending to avoid rendering failures.
 // Returns true on success, false on failure.
-async function sendTwilioText(
-  to: string,
+async function sendText(
+  toChatId: string,
   body: string,
   env: Env
 ): Promise<boolean> {
   const sanitized = sanitize(body);
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`;
-  const params = new URLSearchParams({
-    To: to,
-    From: env.TWILIO_WHATSAPP_FROM,
-    Body: sanitized,
-  });
+  const url = `https://api.green-api.com/waInstance${env.GREENAPI_ID_INSTANCE}/sendMessage/${env.GREENAPI_API_TOKEN}`;
 
-  console.log(
-    `[sendTwilioText] to=${to} from=${env.TWILIO_WHATSAPP_FROM} type=plain`
-  );
+  console.log(`[sendText] to=${toChatId} type=plain`);
 
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: twilioBasicAuth(env),
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: params.toString(),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: toChatId, message: sanitized }),
   });
 
+  const responseBody = await res.text().catch(() => "");
+
   if (res.ok) {
-    const data = (await res.json()) as { sid: string };
-    console.log(`[sendTwilioText] success MessageSid=${data.sid}`);
+    console.log(`[sendText] success response=${responseBody}`);
     return true;
   } else {
-    const text = await res.text().catch(() => "");
-    console.error(`[sendTwilioText] error status=${res.status} body=${text}`);
+    if (res.status === 401 || res.status === 403) {
+      console.error(
+        `[sendText] auth error ${res.status} — check GREENAPI_ID_INSTANCE and GREENAPI_API_TOKEN (instance may be disconnected). body=${responseBody}`
+      );
+    } else {
+      console.error(`[sendText] error status=${res.status} body=${responseBody}`);
+    }
     return false;
   }
 }
@@ -271,13 +264,13 @@ async function postResultWebhook(
 // ─── Bot Logic ────────────────────────────────────────────────────────────────
 
 async function passSession(
-  from: string,
+  chatId: string,
   session: SessionState,
   env: Env
 ): Promise<void> {
   session.completed = true;
   const payload: ResultPayload = {
-    whatsapp_from: from,
+    whatsapp_from: chatId,
     result: "pass",
     reason: "",
     answers: session.answers,
@@ -285,24 +278,27 @@ async function passSession(
   };
 
   await Promise.all([
-    saveSession(from, session, env),
+    saveSession(chatId, session, env),
     postResultWebhook(payload, env),
   ]);
 
-  const link = env.MARIA_WA_ME_LINK ?? "https://wa.me/57xxxxxxxxxx";
+  const link =
+    env.MARIA_WA_ME_LINK ??
+    "https://wa.me/573022379539?text=Hi%20Maria%2C%20I%20passed%20screening%20and%20would%20like%20to%20schedule%20my%20interview.";
   const passMsg =
     "\uD83C\uDF89 *\u00A1Excelente! Has pasado el pre-filtro* \u2705\n\n" +
     "\uD83E\uDDD1\u200D\uD83D\uDCBC Siguiente paso: hablar con una persona del equipo para coordinar tu *primera entrevista*.\n\n" +
     "\uD83D\uDC49 Escribe aqu\u00ED a *Maria Camila* para continuar:\n" +
-    link + "\n\n" +
+    link +
+    "\n\n" +
     "\uD83D\uDCAC _Mensaje sugerido:_\n" +
-    '"Hola Maria, pas\u00E9 el pre-filtro de SpanishVIP. Mi nombre es ___ y mi correo es ___."';
+    '"Hola Maria, pas\u00E9 el pre-filtro de SpanishVIP. Mi nombre es ___ y mi correo es ___.\"';
 
-  await sendTwilioText(from, passMsg, env);
+  await sendText(chatId, passMsg, env);
 }
 
 async function failSession(
-  from: string,
+  chatId: string,
   session: SessionState,
   stepKey: keyof typeof FAIL_MESSAGES,
   reason: string,
@@ -310,7 +306,7 @@ async function failSession(
 ): Promise<void> {
   session.completed = true;
   const payload: ResultPayload = {
-    whatsapp_from: from,
+    whatsapp_from: chatId,
     result: "fail",
     reason,
     answers: session.answers,
@@ -318,24 +314,24 @@ async function failSession(
   };
 
   await Promise.all([
-    saveSession(from, session, env),
+    saveSession(chatId, session, env),
     postResultWebhook(payload, env),
   ]);
 
   const failMsg = FAIL_MESSAGES[stepKey];
-  await sendTwilioText(from, failMsg, env);
+  await sendText(chatId, failMsg, env);
 }
 
 // Sends a short step-specific invalid-input hint followed by the question again,
 // combined into one message to minimise outbound message cost.
 async function sendInvalidInput(
-  from: string,
+  chatId: string,
   step: ScreeningStep,
   env: Env
 ): Promise<void> {
   const hint = INVALID_HINT[step];
   const question = QUESTION_TEXT[step];
-  await sendTwilioText(from, `${hint}\n\n${question}`, env);
+  await sendText(chatId, `${hint}\n\n${question}`, env);
 }
 
 // Normalises the input to match known keywords and numeric options.
@@ -347,8 +343,7 @@ function resolveInput(raw: string): string {
 async function handleStep(
   session: SessionState,
   rawInput: string,
-  inputSource: "payload" | "buttonText" | "body",
-  from: string,
+  chatId: string,
   env: Env
 ): Promise<void> {
   const stepBefore = session.step;
@@ -356,7 +351,7 @@ async function handleStep(
   const input = resolveInput(rawInput);
 
   console.log(
-    `[handleStep] from=${from} step.before=${stepBefore} inputSource=${inputSource} rawInput="${rawInput}"`
+    `[handleStep] chatId=${chatId} step.before=${stepBefore} rawInput="${rawInput}"`
   );
 
   switch (session.step) {
@@ -367,13 +362,13 @@ async function handleStep(
       if (isYes) {
         session.answers.team_role = "yes";
         session.step = "Q2";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q2"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q2"], env);
       } else if (isNo) {
         session.answers.team_role = "no";
-        await failSession(from, session, "Q1", "not team role", env);
+        await failSession(chatId, session, "Q1", "not team role", env);
       } else {
-        await sendInvalidInput(from, "Q1", env);
+        await sendInvalidInput(chatId, "Q1", env);
       }
       return;
     }
@@ -386,30 +381,30 @@ async function handleStep(
       if (isFT) {
         session.answers.weekly_availability = "full_time";
         session.step = "Q3";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q3"], env);
       } else if (isPT) {
         session.answers.weekly_availability = "part_time";
         // If MIN_WEEKLY_HOURS is 30 or more, PT (15-29) fails.
         if (minHours > 29) {
-          await failSession(from, session, "Q2", "low", env);
+          await failSession(chatId, session, "Q2", "low", env);
         } else {
           session.step = "Q3";
-          await saveSession(from, session, env);
-          await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
+          await saveSession(chatId, session, env);
+          await sendText(chatId, QUESTION_TEXT["Q3"], env);
         }
       } else if (isLow) {
         session.answers.weekly_availability = "low";
         // Threshold check: "low" is < 15. If minHours is 1 or more, "low" fails.
         if (minHours >= 1) {
-          await failSession(from, session, "Q2", "low", env);
+          await failSession(chatId, session, "Q2", "low", env);
         } else {
           session.step = "Q3";
-          await saveSession(from, session, env);
-          await sendTwilioText(from, QUESTION_TEXT["Q3"], env);
+          await saveSession(chatId, session, env);
+          await sendText(chatId, QUESTION_TEXT["Q3"], env);
         }
       } else {
-        await sendInvalidInput(from, "Q2", env);
+        await sendInvalidInput(chatId, "Q2", env);
       }
       return;
     }
@@ -422,20 +417,20 @@ async function handleStep(
       if (isNow) {
         session.answers.start_date = "now";
         session.step = "Q4";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q4"], env);
       } else if (isSoon) {
         session.answers.start_date = "soon";
         session.step = "Q4";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q4"], env);
       } else if (isLater) {
         session.answers.start_date = "later";
         session.step = "Q4";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q4"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q4"], env);
       } else {
-        await sendInvalidInput(from, "Q3", env);
+        await sendInvalidInput(chatId, "Q3", env);
       }
       return;
     }
@@ -447,13 +442,13 @@ async function handleStep(
       if (isYes) {
         session.answers.setup = "yes";
         session.step = "Q5";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q5"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q5"], env);
       } else if (isNo) {
         session.answers.setup = "no";
-        await failSession(from, session, "Q4", "no stable setup", env);
+        await failSession(chatId, session, "Q4", "no stable setup", env);
       } else {
-        await sendInvalidInput(from, "Q4", env);
+        await sendInvalidInput(chatId, "Q4", env);
       }
       return;
     }
@@ -465,13 +460,13 @@ async function handleStep(
       if (isYes) {
         session.answers.sop = "yes";
         session.step = "Q6";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q6"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q6"], env);
       } else if (isNo) {
         session.answers.sop = "no";
-        await failSession(from, session, "Q5", "not willing to follow SOP", env);
+        await failSession(chatId, session, "Q5", "not willing to follow SOP", env);
       } else {
-        await sendInvalidInput(from, "Q5", env);
+        await sendInvalidInput(chatId, "Q5", env);
       }
       return;
     }
@@ -484,18 +479,18 @@ async function handleStep(
       if (isGood) {
         session.answers.english_level = "good";
         session.step = "Q7";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q7"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q7"], env);
       } else if (isOk) {
         session.answers.english_level = "ok";
         session.step = "Q7";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q7"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q7"], env);
       } else if (isLow) {
         session.answers.english_level = "low";
-        await failSession(from, session, "Q6", "english_low", env);
+        await failSession(chatId, session, "Q6", "english_low", env);
       } else {
-        await sendInvalidInput(from, "Q6", env);
+        await sendInvalidInput(chatId, "Q6", env);
       }
       return;
     }
@@ -503,16 +498,16 @@ async function handleStep(
     case "Q7": {
       const ageNum = parseInt(rawInput.trim(), 10);
       if (isNaN(ageNum) || ageNum <= 0 || ageNum > 120) {
-        await sendInvalidInput(from, "Q7", env);
+        await sendInvalidInput(chatId, "Q7", env);
         return;
       }
       session.answers.age = ageNum;
       if (ageNum >= 35) {
-        await failSession(from, session, "Q7", "age >= 35", env);
+        await failSession(chatId, session, "Q7", "age >= 35", env);
       } else {
         session.step = "Q8";
-        await saveSession(from, session, env);
-        await sendTwilioText(from, QUESTION_TEXT["Q8"], env);
+        await saveSession(chatId, session, env);
+        await sendText(chatId, QUESTION_TEXT["Q8"], env);
       }
       return;
     }
@@ -526,83 +521,77 @@ async function handleStep(
       };
       const studentType = studentTypeMap[input];
       if (!studentType) {
-        await sendInvalidInput(from, "Q8", env);
+        await sendInvalidInput(chatId, "Q8", env);
         return;
       }
       session.answers.student_types = studentType;
-      await passSession(from, session, env);
+      await passSession(chatId, session, env);
       return;
     }
   }
 }
 
 // processAndSend runs entirely inside ctx.waitUntil() — the webhook has already
-// returned <Response/> before this executes. All user-facing output goes via
-// sendTwilioText().
+// returned 200 before this executes. All user-facing output goes via sendText().
 async function processAndSend(
-  from: string,
-  buttonPayload: string | null,
-  buttonText: string | null,
-  rawBody: string,
+  chatId: string,
+  text: string,
   env: Env
 ): Promise<void> {
   try {
+    const input = text.trim();
+    const upper = input.toUpperCase();
+
+    console.log(`[processAndSend] chatId=${chatId} text="${input}"`);
+
+    // PING — debug command, always reply regardless of session state or rate-limit.
+    if (upper === "PING") {
+      await sendText(chatId, "pong", env);
+      return;
+    }
+
     // Rate limit
-    const allowed = await checkRateLimit(from, env);
+    const allowed = await checkRateLimit(chatId, env);
     if (!allowed) {
-      await sendTwilioText(
-        from,
+      await sendText(
+        chatId,
         "Est\u00E1s enviando mensajes demasiado r\u00E1pido. Por favor, espera un momento.",
         env
       );
       return;
     }
 
-    // Determine input source for logging and routing.
-    // Priority: ButtonPayload > ButtonText > Body
-    const inputSource: "payload" | "buttonText" | "body" = buttonPayload
-      ? "payload"
-      : buttonText
-        ? "buttonText"
-        : "body";
-    const input = (buttonPayload || buttonText || rawBody).trim();
-    const upper = input.toUpperCase();
-
-    console.log(
-      `[processAndSend] from=${from} inputSource=${inputSource} rawInput="${input}"`
-    );
-
     // START and RESTART both clear the session and jump straight to Q1.
     if (upper === "START" || upper === "RESTART") {
-      console.log(`[processAndSend] from=${from} command=${upper} — resetting session`);
-      await safeKvDelete(env.BOT_KV, `session:${from}`);
+      console.log(`[processAndSend] chatId=${chatId} command=${upper} — resetting session`);
+      await safeKvDelete(env.BOT_KV, `wa:${chatIdToDigits(chatId)}`);
       const newSession = createSession();
-      await saveSession(from, newSession, env);
-      await sendTwilioText(from, QUESTION_TEXT["Q1"], env);
+      await saveSession(chatId, newSession, env);
+      await sendText(chatId, QUESTION_TEXT["Q1"], env);
       return;
     }
 
     // Load existing session
-    const session = await loadSession(from, env);
+    const session = await loadSession(chatId, env);
 
     if (!session) {
       // No active session — short prompt only.
-      await sendTwilioText(from, "Escribe START para comenzar \uD83D\uDE0A", env);
+      await sendText(chatId, "Escribe START para comenzar \uD83D\uDE0A", env);
       return;
     }
 
     // If session is already completed, ignore further input unless it's START/RESTART
     if (session.completed) {
-      console.log(`[processAndSend] from=${from} session is completed — ignoring input`);
+      console.log(`[processAndSend] chatId=${chatId} session is completed — ignoring input`);
       return;
     }
 
-    await handleStep(session, input, inputSource, from, env);
+    await handleStep(session, input, chatId, env);
   } catch (err) {
     console.error("processAndSend error:", err);
     try {
-      await sendTwilioText(
-        from,
+      await sendText(
+        chatId,
         "Lo sentimos, algo sali\u00F3 mal. Por favor, escribe *RESTART* para empezar de nuevo.",
         env
       );
@@ -612,33 +601,98 @@ async function processAndSend(
   }
 }
 
+// ─── Green-API Webhook Types ──────────────────────────────────────────────────
+
+interface GreenApiSenderData {
+  chatId: string;
+  chatName: string;
+  sender: string;
+  senderName: string;
+}
+
+interface GreenApiTextMessageData {
+  textMessage: string;
+}
+
+interface GreenApiExtendedTextMessageData {
+  text: string;
+}
+
+interface GreenApiMessageData {
+  typeMessage: string;
+  textMessageData?: GreenApiTextMessageData;
+  extendedTextMessageData?: GreenApiExtendedTextMessageData;
+}
+
+interface GreenApiWebhookPayload {
+  typeWebhook?: string;
+  senderData?: GreenApiSenderData;
+  messageData?: GreenApiMessageData;
+}
+
 // ─── Request Handlers ─────────────────────────────────────────────────────────
 
-async function handleWhatsApp(
+// Handles inbound Green-API webhook notifications.
+//
+// Green-API can send various notification types (stateInstanceChanged, etc.).
+// Rather than allowlisting specific typeWebhook values (which vary across API
+// versions), we inspect the payload directly: if senderData.chatId and a
+// supported messageData.typeMessage are present, we process it; otherwise we
+// ack and discard.
+async function handleGreenApiWebhook(
   request: Request,
   env: Env,
   ctx: ExecutionContext
 ): Promise<Response> {
-  const bodyText = await request.text();
-  const params = new URLSearchParams(bodyText);
-
-  const from = params.get("From") ?? "";
-  // Twilio button reply params (see Twilio docs — ButtonPayload is preferred)
-  const buttonPayload = params.get("ButtonPayload");
-  const buttonText = params.get("ButtonText");
-  const rawBody = params.get("Body") ?? "";
-
-  if (!from) {
-    // No sender — ack and log; we can't send an outbound message without a To
-    console.error("Webhook received without From param");
-    return twimlAck();
+  let payload: GreenApiWebhookPayload;
+  try {
+    payload = (await request.json()) as GreenApiWebhookPayload;
+  } catch {
+    // Malformed JSON — ack immediately
+    return new Response("ok", { status: 200 });
   }
 
-  // Kick off all processing and outbound messaging asynchronously so Twilio
-  // receives the HTTP 200 ack immediately without waiting for our logic.
-  ctx.waitUntil(processAndSend(from, buttonPayload, buttonText, rawBody, env));
+  const chatId = payload.senderData?.chatId ?? "";
+  const typeMessage = payload.messageData?.typeMessage ?? "";
 
-  return twimlAck();
+  if (!chatId) {
+    console.log(
+      `[webhook] no chatId (typeWebhook=${payload.typeWebhook ?? "?"}) — ignoring`
+    );
+    return new Response("ok", { status: 200 });
+  }
+
+  // Ignore group chats (chatId ends with @g.us for groups)
+  if (chatId.endsWith("@g.us")) {
+    console.log(`[webhook] ignoring group chat chatId=${chatId}`);
+    return new Response("ok", { status: 200 });
+  }
+
+  // Extract text from supported message types; ignore everything else
+  let text = "";
+  if (typeMessage === "textMessage") {
+    text = payload.messageData?.textMessageData?.textMessage?.trim() ?? "";
+  } else if (typeMessage === "extendedTextMessage") {
+    // Quoted/forwarded messages carry text in extendedTextMessageData.text
+    text = payload.messageData?.extendedTextMessageData?.text?.trim() ?? "";
+  } else {
+    console.log(
+      `[webhook] ignoring typeMessage=${typeMessage} chatId=${chatId}`
+    );
+    return new Response("ok", { status: 200 });
+  }
+
+  if (!text) {
+    return new Response("ok", { status: 200 });
+  }
+
+  console.log(
+    `[webhook] chatId=${chatId} typeMessage=${typeMessage} text="${text}"`
+  );
+
+  // Return 200 immediately; process asynchronously so Green-API doesn't retry.
+  ctx.waitUntil(processAndSend(chatId, text, env));
+  return new Response("ok", { status: 200 });
 }
 
 async function handleRequest(
@@ -654,8 +708,8 @@ async function handleRequest(
     return new Response("ok", { status: 200 });
   }
 
-  if (method === "POST" && pathname === "/whatsapp") {
-    return handleWhatsApp(request, env, ctx);
+  if (method === "POST" && pathname === "/greenapi/webhook") {
+    return handleGreenApiWebhook(request, env, ctx);
   }
 
   return new Response("Not Found", { status: 404 });
@@ -673,7 +727,7 @@ export default {
       return await handleRequest(request, env, ctx);
     } catch (err) {
       console.error("Unhandled error:", err);
-      return twimlAck();
+      return new Response("ok", { status: 200 });
     }
   },
 };
