@@ -50,6 +50,9 @@ const SESSION_TTL_SECONDS = 604_800;   // 7 days
 const RATE_LIMIT_WINDOW_MS = 10_000;   // 10 seconds
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_KV_TTL = 60;          // 60 seconds (KV minimum)
+const OPTOUT_TTL_SECONDS      = 2_592_000;  // 30 days
+const START_DEDUP_TTL_SECONDS = 60;         // 60 seconds
+const MSGID_TTL_SECONDS       = 300;        // 5 minutes (webhook dedup)
 
 const QUESTION_TEXT: Record<ScreeningStep, string> = {
   Q1: "*Q1/8* \uD83E\uDDE9\nEn SpanishVIP buscamos un rol de *equipo* (no estilo marketplace).\n\u00BFBuscas un rol fijo y comprometido con el equipo?\n1) \u2705 S\u00ED\n2) \u274C No",
@@ -82,6 +85,12 @@ const FAIL_MESSAGES = {
   Q6: "\uD83D\uDCDB \u00A1Gracias!\nPor ahora necesitamos al menos un nivel de ingl\u00E9s para comunicarnos en el equipo (aunque sea _\"me defiendo\"_).\n\n\uD83D\uDE4F Te agradecemos tu tiempo y tu inter\u00E9s en SpanishVIP.",
   Q7: "\uD83D\uDCDB \u00A1Gracias!\nEn este momento estamos buscando candidatos *menores de 35 a\u00F1os* para este rol.\n\n\uD83D\uDE4F Te agradecemos tu tiempo y tu inter\u00E9s en SpanishVIP.",
 };
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ─── Text Sanitization ────────────────────────────────────────────────────────
 
@@ -204,6 +213,35 @@ async function checkRateLimit(chatId: string, env: Env): Promise<boolean> {
   return true;
 }
 
+// ─── Opt-Out Helpers ──────────────────────────────────────────────────────────
+
+// KV key for opt-out: "optout:<digits>", TTL 30 days.
+async function isOptedOut(chatId: string, env: Env): Promise<boolean> {
+  return (await safeKvGet(env.BOT_KV, `optout:${chatIdToDigits(chatId)}`)) === "true";
+}
+
+async function setOptOut(chatId: string, env: Env): Promise<void> {
+  await safeKvPut(env.BOT_KV, `optout:${chatIdToDigits(chatId)}`, "true", {
+    expirationTtl: OPTOUT_TTL_SECONDS,
+  });
+}
+
+async function clearOptOut(chatId: string, env: Env): Promise<void> {
+  await safeKvDelete(env.BOT_KV, `optout:${chatIdToDigits(chatId)}`);
+}
+
+// ─── START Dedup Helper ───────────────────────────────────────────────────────
+
+// KV key: "start_dedup:<digits>", TTL 60 s.
+// Returns true if a START was already processed within the last 60 seconds
+// (duplicate), and false otherwise (sets the key on first call).
+async function checkAndSetStartDedup(chatId: string, env: Env): Promise<boolean> {
+  const key = `start_dedup:${chatIdToDigits(chatId)}`;
+  if (await safeKvGet(env.BOT_KV, key)) return true;
+  await safeKvPut(env.BOT_KV, key, "1", { expirationTtl: START_DEDUP_TTL_SECONDS });
+  return false;
+}
+
 // ─── Green-API REST Helper ────────────────────────────────────────────────────
 
 // Sends a plain text WhatsApp message via the Green-API sendMessage endpoint.
@@ -213,25 +251,45 @@ async function checkRateLimit(chatId: string, env: Env): Promise<boolean> {
 async function sendText(
   toChatId: string,
   body: string,
-  env: Env
+  env: Env,
+  opts?: { skipDelay?: boolean }
 ): Promise<boolean> {
+  // Randomized delay before every send to reduce WhatsApp ban risk.
+  // Pass { skipDelay: true } for instant system ACKs (PING, STOP, etc.).
+  if (!opts?.skipDelay) {
+    await sleep(2000 + Math.random() * 2000);
+  }
+
   const sanitized = sanitize(body);
   const url = `https://api.green-api.com/waInstance${env.GREENAPI_ID_INSTANCE}/sendMessage/${env.GREENAPI_API_TOKEN}`;
 
   console.log(`[sendText] to=${toChatId} type=plain`);
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chatId: toChatId, message: sanitized }),
-  });
+  // Up to 4 attempts total; retries only on HTTP 429 with exponential backoff.
+  for (let attempt = 0; attempt <= 3; attempt++) {
+    if (attempt > 0) {
+      const backoff = Math.pow(2, attempt) * 1000; // 2 s, 4 s, 8 s
+      console.warn(`[sendText] 429 rate-limited — retry attempt=${attempt} backoff=${backoff}ms`);
+      await sleep(backoff);
+    }
 
-  const responseBody = await res.text().catch(() => "");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chatId: toChatId, message: sanitized }),
+    });
 
-  if (res.ok) {
-    console.log(`[sendText] success response=${responseBody}`);
-    return true;
-  } else {
+    const responseBody = await res.text().catch(() => "");
+
+    if (res.ok) {
+      console.log(`[sendText] success response=${responseBody}`);
+      return true;
+    }
+
+    if (res.status === 429 && attempt < 3) {
+      continue; // Will sleep at top of loop on next iteration.
+    }
+
     if (res.status === 401 || res.status === 403) {
       console.error(
         `[sendText] auth error ${res.status} — check GREENAPI_ID_INSTANCE and GREENAPI_API_TOKEN (instance may be disconnected). body=${responseBody}`
@@ -241,6 +299,8 @@ async function sendText(
     }
     return false;
   }
+
+  return false; // Unreachable; satisfies TypeScript exhaustive-return check.
 }
 
 // ─── Result Webhook ───────────────────────────────────────────────────────────
@@ -546,7 +606,54 @@ async function processAndSend(
 
     // PING — debug command, always reply regardless of session state or rate-limit.
     if (upper === "PING") {
-      await sendText(chatId, "pong", env);
+      await sendText(chatId, "pong", env, { skipDelay: true });
+      return;
+    }
+
+    // STOP — opt out: persist flag and send one-time confirmation.
+    if (upper === "STOP") {
+      await setOptOut(chatId, env);
+      await sendText(
+        chatId,
+        "Listo \u2705 No te escribiremos m\u00E1s por aqu\u00ED. Si quieres volver, escribe START.",
+        env,
+        { skipDelay: true }
+      );
+      return;
+    }
+
+    // START and RESTART both clear the session and jump straight to Q1.
+    if (upper === "START" || upper === "RESTART") {
+      const optedOut = await isOptedOut(chatId, env);
+      if (optedOut) {
+        // Re-opting in: clear flags so the user gets a clean start (bypass dedup).
+        await clearOptOut(chatId, env);
+        await safeKvDelete(env.BOT_KV, `start_dedup:${chatIdToDigits(chatId)}`);
+      } else if (upper === "START") {
+        // Dedup: if the user sent START less than 60 s ago, remind them instead.
+        const isDupe = await checkAndSetStartDedup(chatId, env);
+        if (isDupe) {
+          await sendText(
+            chatId,
+            "Ya iniciamos \u2705 Responde con 1/2 seg\u00FAn la pregunta.",
+            env,
+            { skipDelay: true }
+          );
+          return;
+        }
+      }
+      console.log(`[processAndSend] chatId=${chatId} command=${upper} — resetting session`);
+      await safeKvDelete(env.BOT_KV, `wa:${chatIdToDigits(chatId)}`);
+      const newSession = createSession();
+      await saveSession(chatId, newSession, env);
+      await sendText(chatId, QUESTION_TEXT["Q1"], env);
+      return;
+    }
+
+    // Opt-out guard — silently ignore all other messages from opted-out users.
+    const optedOut = await isOptedOut(chatId, env);
+    if (optedOut) {
+      console.log(`[processAndSend] chatId=${chatId} opted out — ignoring`);
       return;
     }
 
@@ -556,18 +663,9 @@ async function processAndSend(
       await sendText(
         chatId,
         "Est\u00E1s enviando mensajes demasiado r\u00E1pido. Por favor, espera un momento.",
-        env
+        env,
+        { skipDelay: true }
       );
-      return;
-    }
-
-    // START and RESTART both clear the session and jump straight to Q1.
-    if (upper === "START" || upper === "RESTART") {
-      console.log(`[processAndSend] chatId=${chatId} command=${upper} — resetting session`);
-      await safeKvDelete(env.BOT_KV, `wa:${chatIdToDigits(chatId)}`);
-      const newSession = createSession();
-      await saveSession(chatId, newSession, env);
-      await sendText(chatId, QUESTION_TEXT["Q1"], env);
       return;
     }
 
@@ -593,7 +691,8 @@ async function processAndSend(
       await sendText(
         chatId,
         "Lo sentimos, algo sali\u00F3 mal. Por favor, escribe *RESTART* para empezar de nuevo.",
-        env
+        env,
+        { skipDelay: true }
       );
     } catch {
       // swallow — nothing more we can do
@@ -626,6 +725,7 @@ interface GreenApiMessageData {
 
 interface GreenApiWebhookPayload {
   typeWebhook?: string;
+  idMessage?: string;
   senderData?: GreenApiSenderData;
   messageData?: GreenApiMessageData;
 }
@@ -689,6 +789,18 @@ async function handleGreenApiWebhook(
   console.log(
     `[webhook] chatId=${chatId} typeMessage=${typeMessage} text="${text}"`
   );
+
+  // Deduplicate on idMessage to guard against Green-API webhook retries.
+  const msgId = payload.idMessage;
+  if (msgId) {
+    const dedupKey = `msgid:${msgId}`;
+    const seen = await safeKvGet(env.BOT_KV, dedupKey);
+    if (seen) {
+      console.log(`[webhook] duplicate msgId=${msgId} — ignoring`);
+      return new Response("ok", { status: 200 });
+    }
+    await safeKvPut(env.BOT_KV, dedupKey, "1", { expirationTtl: MSGID_TTL_SECONDS });
+  }
 
   // Return 200 immediately; process asynchronously so Green-API doesn't retry.
   ctx.waitUntil(processAndSend(chatId, text, env));
