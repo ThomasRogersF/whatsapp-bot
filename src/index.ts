@@ -251,10 +251,14 @@ async function checkAndSetStartDedup(chatId: string, env: Env): Promise<boolean>
 async function sendText(
   toChatId: string,
   body: string,
-  env: Env
+  env: Env,
+  opts?: { skipDelay?: boolean }
 ): Promise<boolean> {
   // Randomized delay before every send to reduce WhatsApp ban risk.
-  await sleep(2000 + Math.random() * 2000);
+  // Pass { skipDelay: true } for instant system ACKs (PING, STOP, etc.).
+  if (!opts?.skipDelay) {
+    await sleep(2000 + Math.random() * 2000);
+  }
 
   const sanitized = sanitize(body);
   const url = `https://api.green-api.com/waInstance${env.GREENAPI_ID_INSTANCE}/sendMessage/${env.GREENAPI_API_TOKEN}`;
@@ -602,7 +606,7 @@ async function processAndSend(
 
     // PING — debug command, always reply regardless of session state or rate-limit.
     if (upper === "PING") {
-      await sendText(chatId, "pong", env);
+      await sendText(chatId, "pong", env, { skipDelay: true });
       return;
     }
 
@@ -612,7 +616,8 @@ async function processAndSend(
       await sendText(
         chatId,
         "Listo \u2705 No te escribiremos m\u00E1s por aqu\u00ED. Si quieres volver, escribe START.",
-        env
+        env,
+        { skipDelay: true }
       );
       return;
     }
@@ -631,7 +636,8 @@ async function processAndSend(
           await sendText(
             chatId,
             "Ya iniciamos \u2705 Responde con 1/2 seg\u00FAn la pregunta.",
-            env
+            env,
+            { skipDelay: true }
           );
           return;
         }
@@ -657,7 +663,8 @@ async function processAndSend(
       await sendText(
         chatId,
         "Est\u00E1s enviando mensajes demasiado r\u00E1pido. Por favor, espera un momento.",
-        env
+        env,
+        { skipDelay: true }
       );
       return;
     }
@@ -684,7 +691,8 @@ async function processAndSend(
       await sendText(
         chatId,
         "Lo sentimos, algo sali\u00F3 mal. Por favor, escribe *RESTART* para empezar de nuevo.",
-        env
+        env,
+        { skipDelay: true }
       );
     } catch {
       // swallow — nothing more we can do
