@@ -17,7 +17,7 @@ MIN_WEEKLY_HOURS = "15"
 
 # Your Green-API instance ID (numeric string shown in the Green-API dashboard).
 # Example: "1234567890"
-GREENAPI_ID_INSTANCE = ""
+GREENAPI_ID_INSTANCE = "7103532484"
 
 # Link sent to candidates who PASS screening (wa.me deep-link to Maria).
 MARIA_WA_ME_LINK = "https://wa.me/573022379539?text=Hi%20Maria%2C%20I%20passed%20screening%20and%20would%20like%20to%20schedule%20my%20interview."
