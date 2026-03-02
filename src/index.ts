@@ -54,6 +54,12 @@ const OPTOUT_TTL_SECONDS      = 2_592_000;  // 30 days
 const START_DEDUP_TTL_SECONDS = 60;         // 60 seconds
 const MSGID_TTL_SECONDS       = 300;        // 5 minutes (webhook dedup)
 
+const INTRO_TEXT =
+  "\uD83D\uDC4B \u00A1Hola! Gracias por tu inter\u00E9s en SpanishVIP.\n" +
+  "Esto es un pre-filtro r\u00E1pido (2\u20133 minutos).\n" +
+  "Responde con el n\u00FAmero de cada opci\u00F3n (por ejemplo: 1).\n" +
+  "Si en cualquier momento deseas dejar de recibir mensajes, escribe STOP. \u2705";
+
 const QUESTION_TEXT: Record<ScreeningStep, string> = {
   Q1: "*Q1/8* \uD83E\uDDE9\nEn SpanishVIP buscamos un rol de *equipo* (no estilo marketplace).\n\u00BFBuscas un rol fijo y comprometido con el equipo?\n1) \u2705 S\u00ED\n2) \u274C No",
   Q2: "*Q2/8* \uD83D\uDDD3\uFE0F\n\u00BFCu\u00E1ntas horas por semana puedes comprometerte de forma constante?\n1) \uD83D\uDCAA Tiempo completo (30+ hrs/sem)\n2) \uD83D\uDE42 Medio tiempo (15\u201329 hrs/sem)\n3) \uD83E\uDD72 Menos de 15 hrs/sem",
@@ -646,7 +652,7 @@ async function processAndSend(
       await safeKvDelete(env.BOT_KV, `wa:${chatIdToDigits(chatId)}`);
       const newSession = createSession();
       await saveSession(chatId, newSession, env);
-      await sendText(chatId, QUESTION_TEXT["Q1"], env);
+      await sendText(chatId, `${INTRO_TEXT}\n\n${QUESTION_TEXT["Q1"]}`, env);
       return;
     }
 
