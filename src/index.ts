@@ -652,8 +652,7 @@ async function processAndSend(
       await safeKvDelete(env.BOT_KV, `wa:${chatIdToDigits(chatId)}`);
       const newSession = createSession();
       await saveSession(chatId, newSession, env);
-      await sendText(chatId, INTRO_TEXT, env);
-      await sendText(chatId, QUESTION_TEXT["Q1"], env);
+      await sendText(chatId, `${INTRO_TEXT}\n\n${QUESTION_TEXT["Q1"]}`, env);
       return;
     }
 
