@@ -13,14 +13,14 @@ preview_id = "1c7c788345da4a19911f869d2211b58a"
 # ─── Environment Variables ────────────────────────────────────────────────────
 [vars]
 # Minimum weekly hours threshold for Q2 part-time acceptance (default 15).
-MIN_WEEKLY_HOURS = "15"
+MIN_WEEKLY_HOURS = "14"
 
 # Your Green-API instance ID (numeric string shown in the Green-API dashboard).
 # Example: "1234567890"
 GREENAPI_ID_INSTANCE = "7103532484"
 
 # Link sent to candidates who PASS screening (wa.me deep-link to Maria).
-MARIA_WA_ME_LINK = "https://wa.me/573022379539?text=Hi%20Maria%2C%20I%20passed%20screening%20and%20would%20like%20to%20schedule%20my%20interview."
+MARIA_WA_ME_LINK = "https://wa.me/573022379539?text=Hola%20Maria%2C%20pas%C3%A9%20el%20pre-filtro%20de%20SpanishVIP.%20Me%20gustar%C3%ADa%20agendar%20mi%20primera%20entrevista.%20Mi%20nombre%20es%20___%20y%20mi%20correo%20es%20"
 
 # ─── Secrets ──────────────────────────────────────────────────────────────────
 # The following values must be set as Cloudflare Worker secrets (never committed
